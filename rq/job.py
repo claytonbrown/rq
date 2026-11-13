@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import logging
 import re
 import warnings
 import zlib
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Any, cast
@@ -15,8 +15,7 @@ from uuid import uuid4
 
 from redis import WatchError
 
-from .defaults import CALLBACK_TIMEOUT, UNSERIALIZABLE_RETURN_VALUE_PAYLOAD
-from .timeouts import BaseDeathPenalty, JobTimeoutException
+from .defaults import CALLBACK_TIMEOUT, RQ_KEY_PREFIX, UNSERIALIZABLE_RETURN_VALUE_PAYLOAD
 from .types import FailureCallbackType, SuccessCallbackType
 
 if TYPE_CHECKING:
@@ -33,8 +32,8 @@ if TYPE_CHECKING:
         pass
 
 
+from .callbacks import Callback
 from .exceptions import DeserializationError, InvalidJobOperation, NoSuchJobError
-from .local import LocalStack
 from .serializers import resolve_serializer
 from .types import FunctionReferenceType, JobDependencyType
 from .utils import (
@@ -49,6 +48,7 @@ from .utils import (
     str_to_date,
     utcformat,
 )
+from .webhook import Webhook
 
 logger = logging.getLogger('rq.job')
 
@@ -67,6 +67,8 @@ class JobStatus(str, Enum):
     SCHEDULED = 'scheduled'
     STOPPED = 'stopped'
     CANCELED = 'canceled'
+    RATE_LIMITED = 'rate_limited'
+    READY_TO_ENQUEUE = 'ready_to_enqueue'
 
 
 def parse_job_id(job_or_execution_id: str) -> str:
@@ -150,7 +152,7 @@ def get_current_job(connection: Redis | None = None, job_class: Job | None = Non
         warnings.warn('connection argument for get_current_job is deprecated.', DeprecationWarning)
     if job_class:
         warnings.warn('job_class argument for get_current_job is deprecated.', DeprecationWarning)
-    return _job_stack.top
+    return _current_job.get()
 
 
 def requeue_job(job_id: str, connection: Redis, serializer=None) -> Job:
@@ -172,7 +174,7 @@ class Job:
     """A Job is just a convenient datastructure to pass around job (meta) data."""
 
     _dependency: Job | None
-    redis_job_namespace_prefix = 'rq:job:'
+    redis_job_namespace_prefix = RQ_KEY_PREFIX + ':job:'
 
     def __init__(self, id: str | None = None, connection: Redis | None = None, serializer=None):
         # Manually check for the presence of the connection argument to preserve
@@ -195,6 +197,7 @@ class Job:
         self._failure_callback: Callable[[Job, Redis, Unpack[tuple[ExcInfo]]], Any] | UnevaluatedType = UNEVALUATED
         self._stopped_callback_name: str | None = None
         self._stopped_callback: Callable[[Job, Redis], Any] | UnevaluatedType | None = UNEVALUATED
+        self.webhooks: list[Webhook] = []
         self.description: str | None = None
         self.origin: str = ''
         self.enqueued_at: datetime | None = None
@@ -213,6 +216,8 @@ class Job:
         self._status: JobStatus = JobStatus.CREATED
         self._dependency_ids: list[str] = []
         self.meta: dict[str, Any] = {}
+        # Stored meta that could not be deserialized here, kept so a save writes it back unchanged.
+        self._unreadable_meta: bytes | None = None
         self.serializer = resolve_serializer(serializer)
         # Tracks remaining retries for exception-based retry. Set to retry.max when a job
         # is enqueued with retry=Retry(...) via queue.enqueue(). Decremented each time
@@ -232,6 +237,9 @@ class Job:
         self.repeats_left: int | None = None
         self.repeat_intervals: list[int] | None = None
 
+        self.rate_limit_key: str | None = None
+        self.rate_limit_concurrency: int | None = None
+
         self._cached_result: Result | None = None
         self.log = logger
 
@@ -248,6 +256,7 @@ class Job:
         description: str | None = None,
         depends_on: JobDependencyType | None = None,
         timeout: int | None = None,
+        retry: Retry | None = None,
         id: str | None = None,
         origin: str = '',
         meta: dict[str, Any] | None = None,
@@ -258,6 +267,7 @@ class Job:
         on_success: Callback | Callable[..., Any] | None = None,  # Callable is deprecated
         on_failure: Callback | Callable[..., Any] | None = None,  # Callable is deprecated
         on_stopped: Callback | Callable[..., Any] | None = None,  # Callable is deprecated
+        webhooks: Sequence[Webhook] | None = None,
     ) -> Job:
         """Creates a new Job instance for the given function, arguments, and
         keyword arguments.
@@ -296,6 +306,8 @@ class Job:
                 fails. Defaults to None. Passing a callable is deprecated.
             on_stopped (Optional[Union['Callback', Callable[..., Any]]], optional): A callback to run when/if the Job
                 is stopped. Defaults to None. Passing a callable is deprecated.
+            webhooks (Optional[Sequence[Webhook]], optional): Webhooks to send when the job reaches a matching
+                terminal state (`finished` or `failed`). Defaults to None.
             group_id (Optional[str], optional): A group ID that the job is being added to. Defaults to None.
 
         Raises:
@@ -305,6 +317,7 @@ class Job:
             ValueError: If `on_failure` is not a Callback or function or string
             ValueError: If `on_success` is not a Callback or function or string
             ValueError: If `on_stopped` is not a Callback or function or string
+            TypeError: If `webhooks` is not a list of Webhook instances
 
         Returns:
             Job: A job instance.
@@ -356,6 +369,11 @@ class Job:
             job._stopped_callback_name = on_stopped.name
             job._stopped_callback_timeout = on_stopped.timeout
 
+        if webhooks:
+            if not isinstance(webhooks, Sequence) or not all(isinstance(webhook, Webhook) for webhook in webhooks):
+                raise TypeError('webhooks must be a sequence of Webhook instances')
+            job.webhooks = list(webhooks)
+
         # Extra meta data
         job.description = description or job.get_call_string()
         job.result_ttl = parse_timeout(result_ttl)
@@ -364,6 +382,11 @@ class Job:
         job.timeout = parse_timeout(timeout)
         job.meta = meta or {}
         job.group_id = group_id
+
+        if retry is not None:
+            job.retries_left = retry.max
+            job.enqueue_at_front_on_retry = retry.enqueue_at_front
+            job.retry_intervals = retry.intervals
 
         # Process job dependencies
         if depends_on is not None:
@@ -378,7 +401,7 @@ class Job:
         return job
 
     def get_position(self) -> int | None:
-        """Get's the job's position on the queue
+        """Gets the job's position on the queue
 
         Returns:
             position (Optional[int]): The position
@@ -403,11 +426,15 @@ class Job:
             status (JobStatus): The Job Status
         """
         if refresh:
-            status = self.connection.hget(self.key, 'status')
-            if not status:
-                raise InvalidJobOperation(f'Failed to retrieve status for job: {self.id}')
-            self._status = JobStatus(as_text(status))
+            self._status = self._fetch_status()
         return self._status
+
+    def _fetch_status(self) -> JobStatus:
+        """Reads the status stored in Redis without updating the cached status."""
+        status = self.connection.hget(self.key, 'status')
+        if not status:
+            raise InvalidJobOperation(f'Failed to retrieve status for job: {self.id}')
+        return JobStatus(as_text(status))
 
     def set_status(self, status: JobStatus, pipeline: Pipeline | None = None) -> None:
         """Set's the Job Status
@@ -421,7 +448,7 @@ class Job:
         connection.hset(self.key, 'status', self._status)
 
     def get_meta(self, refresh: bool = True) -> dict:
-        """Get's the metadata for a Job, an arbitrary dictionary.
+        """Gets the metadata for a Job, an arbitrary dictionary.
 
         Args:
             refresh (bool, optional): Whether to refresh. Defaults to True.
@@ -466,6 +493,10 @@ class Job:
     @property
     def is_stopped(self) -> bool:
         return self.get_status() == JobStatus.STOPPED
+
+    @property
+    def is_ready_to_enqueue(self) -> bool:
+        return self.get_status() == JobStatus.READY_TO_ENQUEUE
 
     @property
     def _dependency_id(self):
@@ -556,6 +587,10 @@ class Job:
             return CALLBACK_TIMEOUT
 
         return self._stopped_callback_timeout
+
+    @property
+    def has_rate_limit(self) -> bool:
+        return bool(self.rate_limit_key and self.rate_limit_concurrency)
 
     def should_enqueue_at_front(self) -> bool:
         """returns true when the argument enqueue_at_front_on_retry is true and the job has been executed at least once
@@ -992,6 +1027,13 @@ class Job:
         if 'stopped_callback_timeout' in obj:
             self._stopped_callback_timeout = int(obj['stopped_callback_timeout'])
 
+        if obj.get('webhooks'):
+            try:
+                self.webhooks = [Webhook.from_dict(data) for data in json.loads(obj['webhooks'].decode())]
+            except Exception:
+                self.log.warning('Job %s: failed to deserialize webhooks', self.id, exc_info=True)
+                self.webhooks = []
+
         dep_ids = obj.get('dependency_ids')
         dep_id = obj.get('dependency_id')  # for backwards compatibility
         self._dependency_ids = json.loads(dep_ids.decode()) if dep_ids else [dep_id.decode()] if dep_id else []
@@ -999,10 +1041,12 @@ class Job:
         self.allow_dependency_failures = bool(int(allow_failures)) if allow_failures else None
         self.enqueue_at_front = bool(int(obj['enqueue_at_front'])) if 'enqueue_at_front' in obj else None
         self.ttl = int(obj['ttl']) if obj.get('ttl') else None
+        self._unreadable_meta = None
         try:
             self.meta = self.serializer.loads(obj['meta']) if obj.get('meta') else {}
         except Exception:  # depends on the serializer
             self.meta = {'unserialized': obj.get('meta', {})}
+            self._unreadable_meta = obj['meta']
 
         self.number_of_retries = int(obj['number_of_retries']) if obj.get('number_of_retries') else None
         self.retries_left = int(obj['retries_left']) if obj.get('retries_left') else None
@@ -1016,6 +1060,9 @@ class Job:
         self.repeats_left = int(obj['repeats_left']) if obj.get('repeats_left') else None
         if obj.get('repeat_intervals'):
             self.repeat_intervals = json.loads(obj['repeat_intervals'].decode())
+
+        self.rate_limit_key = as_text(obj['rate_limit_key']) if obj.get('rate_limit_key') else None
+        self.rate_limit_concurrency = int(obj['rate_limit_concurrency']) if obj.get('rate_limit_concurrency') else None
 
         raw_exc_info = obj.get('exc_info')
         if raw_exc_info:
@@ -1084,6 +1131,11 @@ class Job:
         if self.repeat_intervals is not None:
             obj['repeat_intervals'] = json.dumps(self.repeat_intervals)
 
+        if self.rate_limit_key:
+            obj['rate_limit_key'] = self.rate_limit_key
+        if self.rate_limit_concurrency:
+            obj['rate_limit_concurrency'] = self.rate_limit_concurrency
+
         if self._result is not None and include_result:
             try:
                 obj['result'] = self.serializer.dumps(self._result)
@@ -1099,6 +1151,8 @@ class Job:
             obj['failure_callback_timeout'] = self._failure_callback_timeout
         if self._stopped_callback_timeout is not None:
             obj['stopped_callback_timeout'] = self._stopped_callback_timeout
+        if self.webhooks:
+            obj['webhooks'] = json.dumps([webhook.to_dict() for webhook in self.webhooks])
         if self.result_ttl is not None:
             obj['result_ttl'] = self.result_ttl
         if self.failure_ttl is not None:
@@ -1108,7 +1162,7 @@ class Job:
             obj['dependency_id'] = self._dependency_ids[0]  # for backwards compatibility
             obj['dependency_ids'] = json.dumps(self._dependency_ids)
         if self.meta and include_meta:
-            obj['meta'] = self.serializer.dumps(self.meta)
+            obj['meta'] = self._serialize_meta()
         if self.ttl:
             obj['ttl'] = self.ttl
 
@@ -1145,15 +1199,23 @@ class Job:
 
     def save_meta(self):
         """Stores job meta from the job instance to the corresponding Redis key."""
-        meta = self.serializer.dumps(self.meta)
+        meta = self._serialize_meta()
         self.connection.hset(self.key, 'meta', meta)
+
+    def _serialize_meta(self) -> bytes:
+        # If this process could not deserialize the stored meta and it is still the
+        # placeholder holding those bytes, write the bytes back instead of the placeholder.
+        is_placeholder = len(self.meta) == 1 and self.meta.get('unserialized') is self._unreadable_meta
+        if is_placeholder and self._unreadable_meta is not None:
+            return self._unreadable_meta
+        return self.serializer.dumps(self.meta)
 
     def cancel(
         self,
         pipeline: Pipeline | None = None,
         enqueue_dependents: bool = False,
         remove_from_dependencies: bool = False,
-    ):
+    ) -> dict[str, list[str]]:
         """Cancels the given job, which will prevent the job from ever being
         ran (or inspected).
 
@@ -1161,22 +1223,41 @@ class Job:
         without worrying about the internals required to implement job
         cancellation.
 
-        You can enqueue the jobs dependents optionally,
-        Same pipelining behavior as Queue.enqueue_dependents on whether or not a pipeline is passed in.
+        You can optionally enqueue the job's dependents. When ``enqueue_dependents`` is
+        True, eligible dependents are moved deferred→ready atomically with this job's
+        CANCELED status, then enqueued onto their queues.
+
+        On the no-pipeline path, the whole thing runs in cancel's own WATCH/MULTI/EXEC and
+        the dependents are enqueued before this method returns. When called with
+        ``pipeline=external_pipe``, the pipeline must already be in WATCH mode. The
+        deferred→ready ops are appended to the caller's transaction; the caller owns
+        the EXEC and is responsible for draining the returned mapping via
+        ``Queue.enqueue_ready_jobs_by_queue(mapping)`` afterwards (otherwise
+        ``ReadyJobRegistry.cleanup()`` recovers the dependents later).
 
         Args:
             pipeline (Optional[Pipeline], optional): The Redis' pipeline to use. Defaults to None.
             enqueue_dependents (bool, optional): Whether to enqueue dependents jobs. Defaults to False.
+
+        Returns:
+            Map of origin queue name → list of dependent job ids that were moved to
+            ready. Empty dict when ``enqueue_dependents=False`` or no eligible dependents.
 
         Raises:
             InvalidJobOperation: If the job has already been cancelled.
         """
         if self.is_canceled:
             raise InvalidJobOperation(f'Cannot cancel already canceled job: {self.id}')
+        if pipeline is not None and self.has_rate_limit:
+            # Promotion only runs after the caller's EXEC, which happens after cancel()
+            # returns — the slot would sit freed with nobody promoted until the next
+            # release or cleanup. Forbid the combination instead.
+            raise InvalidJobOperation('Cannot cancel a rate-limited job with a caller-supplied pipeline')
         from .queue import Queue
         from .registry import CanceledJobRegistry
 
         pipe = pipeline or self.connection.pipeline()
+        dependent_job_ids_by_queue: dict[str, list[str]] = {}
 
         while True:
             try:
@@ -1184,12 +1265,22 @@ class Job:
                     name=self.origin, connection=self.connection, job_class=self.__class__, serializer=self.serializer
                 )
 
-                self.set_status(JobStatus.CANCELED, pipeline=pipe)
                 if enqueue_dependents:
                     # Only WATCH if no pipeline passed, otherwise caller is responsible
                     if pipeline is None:
                         pipe.watch(self.dependents_key)
-                    q.enqueue_dependents(self, pipeline=pipeline, exclude_job_id=self.id)
+                    # Move dependents to ready inside THIS transaction (pass pipe, not the
+                    # original pipeline arg) so the deferred→ready transition commits
+                    # atomically with the CANCELED status below. Reads run immediately while
+                    # watching; move() calls multi() once it has dependents to write.
+                    dependent_job_ids_by_queue = q.move_dependents_to_ready(self, pipeline=pipe, exclude_job_id=self.id)
+
+                # Ensure a transaction is open before buffering cancel's own writes. move()
+                # only calls multi() when there are dependents, so guard like the worker does.
+                if pipeline is None and not pipe.explicit_transaction:
+                    pipe.multi()
+
+                self.set_status(JobStatus.CANCELED, pipeline=pipe)
 
                 if remove_from_dependencies:
                     # Go through all dependencies and remove the current job from each dependency's dependents_key
@@ -1202,17 +1293,39 @@ class Job:
                     self.origin, self.connection, job_class=self.__class__, serializer=self.serializer
                 )
                 registry.add(self, pipeline=pipe)
+
                 if pipeline is None:
                     pipe.execute()
                 break
             except WatchError:
                 if pipeline is None:
+                    dependent_job_ids_by_queue = {}
                     continue
                 else:
                     # if the pipeline comes from the caller, we re-raise the
                     # exception as it is the responsibility of the caller to
                     # handle it
                     raise
+            except Exception:
+                # Release the connection on any other error so a mid-transaction failure
+                # (after WATCH) doesn't abandon the pipeline while it still holds a
+                # connection in a WATCH state, leaking it from the pool.
+                if pipeline is None:
+                    pipe.reset()
+                raise
+
+        # Drain ready dependents onto their queues only after the cancel transaction has
+        # committed. On the caller-owned pipeline path the external caller drains the
+        # returned mapping after their own EXEC.
+        if pipeline is None and enqueue_dependents:
+            q.enqueue_ready_jobs_by_queue(dependent_job_ids_by_queue)
+
+        if self.has_rate_limit:
+            from .rate_limit import RateLimitRegistry
+
+            RateLimitRegistry.from_job(self).cancel(self.id)
+
+        return dependent_job_ids_by_queue
 
     def requeue(self, at_front: bool = False) -> Job:
         """Requeues job
@@ -1243,7 +1356,10 @@ class Job:
             q = Queue(name=self.origin, connection=self.connection, serializer=self.serializer)
             q.remove(self, pipeline=pipeline)
         registry: BaseRegistry
-        if self.is_finished:
+        # Read the stored status without overwriting the cached one, which the caller may have
+        # already changed in `pipeline` (e.g. FINISHED or FAILED before deleting the job).
+        status = self._fetch_status()
+        if status == JobStatus.FINISHED:
             from .registry import FinishedJobRegistry
 
             registry = FinishedJobRegistry(
@@ -1251,7 +1367,7 @@ class Job:
             )
             registry.remove(self, pipeline=pipeline)
 
-        elif self.is_deferred:
+        elif status == JobStatus.DEFERRED:
             from .registry import DeferredJobRegistry
 
             registry = DeferredJobRegistry(
@@ -1259,7 +1375,15 @@ class Job:
             )
             registry.remove(self, pipeline=pipeline)
 
-        elif self.is_started:
+        elif status == JobStatus.READY_TO_ENQUEUE:
+            from .registry import ReadyJobRegistry
+
+            registry = ReadyJobRegistry(
+                self.origin, connection=self.connection, job_class=self.__class__, serializer=self.serializer
+            )
+            registry.remove(self, pipeline=pipeline)
+
+        elif status == JobStatus.STARTED:
             from .registry import StartedJobRegistry
 
             # TODO: need to cleanup job executions too
@@ -1268,7 +1392,7 @@ class Job:
             )
             registry.remove_executions(self, pipeline=pipeline)
 
-        elif self.is_scheduled:
+        elif status == JobStatus.SCHEDULED:
             from .registry import ScheduledJobRegistry
 
             registry = ScheduledJobRegistry(
@@ -1276,11 +1400,11 @@ class Job:
             )
             registry.remove(self, pipeline=pipeline)
 
-        elif self.is_failed or self.is_stopped:
+        elif status in (JobStatus.FAILED, JobStatus.STOPPED):
             # TODO: need to cleanup job executions too
             self.failed_job_registry.remove(self, pipeline=pipeline)
 
-        elif self.is_canceled:
+        elif status == JobStatus.CANCELED:
             from .registry import CanceledJobRegistry
 
             registry = CanceledJobRegistry(
@@ -1289,7 +1413,7 @@ class Job:
             registry.remove(self, pipeline=pipeline)
 
     def delete(self, pipeline: Pipeline | None = None, remove_from_queue: bool = True, delete_dependents: bool = False):
-        """Cancels the job and deletes the job hash from Redis. Jobs depending
+        """Cancels the job and deletes its hash and execution results from Redis. Jobs depending
         on this job can optionally be deleted as well.
 
         Args:
@@ -1297,20 +1421,33 @@ class Job:
             remove_from_queue (bool, optional): Whether the job should be removed from the queue. Defaults to True.
             delete_dependents (bool, optional): Whether job dependents should also be deleted. Defaults to False.
         """
+        from .results import Result
+
         connection = pipeline if pipeline is not None else self.connection
 
         self._remove_from_registries(pipeline=pipeline, remove_from_queue=remove_from_queue)
 
         if delete_dependents:
             self.delete_dependents(pipeline=pipeline)
-        self.execution_registry.delete(job=self, pipeline=connection)  # type: ignore
+        if not self.has_rate_limit:
+            # If a rate-limited job is still running (has a live execution), we don't delete the execution.
+            # Deleting it could free the job's slot and enqueue another job, going over the allowed concurrency.
+            self.execution_registry.delete(job=self, pipeline=connection)  # type: ignore
         if self.group_id:
             from .group import Group
 
             group = Group.fetch(self.group_id, self.connection)
             group.delete_job(self.id, pipeline=pipeline)
 
-        connection.delete(self.key, self.dependents_key, self.dependencies_key)
+        connection.delete(self.key, self.dependents_key, self.dependencies_key, Result.get_key(self.id))
+
+        if self.has_rate_limit:
+            from .rate_limit import RateLimitRegistry
+
+            # No-pipeline: if the job has no live execution, release its slot and promote immediately.
+            # Caller-owned pipeline: only drop it from rate_limited; its slot is released and
+            # waiting jobs promoted by the horse's release or maintenance cleanup.
+            RateLimitRegistry.from_job(self).cancel(self.id, pipeline=pipeline)
 
     def delete_dependents(self, pipeline: Pipeline | None = None):
         """Delete jobs depending on this job.
@@ -1336,12 +1473,12 @@ class Job:
         Returns:
             result (Any): The job result
         """
-        self.connection.persist(self.key)
-        _job_stack.push(self)
+        token = _current_job.set(self)
         try:
             self._result = self._execute()
         finally:
-            assert self is _job_stack.pop()
+            assert _current_job.get() is self
+            _current_job.reset(token)
         return self._result
 
     def process_dependencies(self, depends_on: JobDependencyType) -> None:
@@ -1401,9 +1538,7 @@ class Job:
             raise ValueError('Cannot execute job: function is None')
         result = self.func(*self.args, **self.kwargs)
         if asyncio.iscoroutine(result):
-            loop = asyncio.new_event_loop()
-            coro_result = loop.run_until_complete(result)
-            return coro_result
+            return asyncio.run(result)
         return result
 
     def get_ttl(self, default_ttl: int | None = None) -> int | None:
@@ -1490,46 +1625,14 @@ class Job:
             self.origin, connection=self.connection, job_class=self.__class__, serializer=self.serializer
         )
 
-    def execute_success_callback(self, death_penalty_class: type[BaseDeathPenalty], result: Any):
-        """Executes success_callback for a job.
-        with timeout .
-
-        Args:
-            death_penalty_class (Type[BaseDeathPenalty]): The penalty class to use for timeout
-            result (Any): The job's result.
-        """
-        if not self.success_callback:
-            return
-
-        self.log.debug('Job %s: running success callback...', self.id)
-        with death_penalty_class(self.success_callback_timeout, JobTimeoutException, job_id=self.id):
-            self.success_callback(self, self.connection, result)
-
-    def execute_failure_callback(self, death_penalty_class: type[BaseDeathPenalty], *exc_info):
-        """Executes failure_callback with possible timeout"""
-        if not self.failure_callback:
-            return
-
-        self.log.debug('Job %s: running failure callback...', self.id)
-        try:
-            with death_penalty_class(self.failure_callback_timeout, JobTimeoutException, job_id=self.id):
-                self.failure_callback(self, self.connection, *exc_info)
-        except Exception:  # noqa
-            self.log.exception('Job %s: error while executing failure callback', self.id)
-            raise
-
-    def execute_stopped_callback(self, death_penalty_class: type[BaseDeathPenalty]):
-        """Executes stopped_callback with possible timeout"""
-        if self.stopped_callback is None:
-            return
-
-        self.log.debug('Job %s: running stopped callback...', self.id)
-        try:
-            with death_penalty_class(self.stopped_callback_timeout, JobTimeoutException, job_id=self.id):
-                self.stopped_callback(self, self.connection)
-        except Exception:  # noqa
-            self.log.exception('Job %s: error while executing stopped callback', self.id)
-            raise
+    def send_webhooks(self, status: str | JobStatus, *, exc_string: str | None = None) -> None:
+        """Sends every webhook registered for the given terminal job status.
+        `exc_string` is included in the payload of `failed` webhooks.
+        Send errors are logged by `Webhook.send()`, never raised."""
+        for webhook in self.webhooks:
+            if webhook.job_status == status:
+                self.log.debug('Job %s: sending %s webhook to %s', self.id, webhook.job_status, webhook.url)
+                webhook.send(self, exc_string=exc_string)
 
     def _handle_success(
         self,
@@ -1606,7 +1709,7 @@ class Job:
         execution_started_at: datetime,
         execution_ended_at: datetime,
         worker_name: str = '',
-    ):
+    ) -> None:
         """Handles jobs that return a Retry object as its result.
 
         Creates a RETRIED result record, increments number_of_retries,
@@ -1635,6 +1738,7 @@ class Job:
         )
         retry_interval = Retry.get_interval(self.number_of_retries or 0, retry.intervals)
         self.number_of_retries = 1 if not self.number_of_retries else self.number_of_retries + 1
+        self.enqueue_at_front_on_retry = self.enqueue_at_front_on_retry or retry.enqueue_at_front
         if retry_interval:
             scheduled_datetime = now() + timedelta(seconds=retry_interval)
             self.set_status(JobStatus.SCHEDULED)
@@ -1646,7 +1750,7 @@ class Job:
                 retry.max - (self.number_of_retries or 0),
             )
         else:
-            queue._enqueue_job(self, pipeline=pipeline)
+            queue._enqueue_job(self, pipeline=pipeline, at_front=self.enqueue_at_front_on_retry)
             self.log.info(
                 'Job %s: enqueued for retry, %s remaining',
                 self.id,
@@ -1806,7 +1910,7 @@ class Job:
         return all(status.decode() in allowed_statuses for status in dependencies_statuses if status)
 
 
-_job_stack = LocalStack()
+_current_job: ContextVar[Job | None] = ContextVar('current_job', default=None)
 
 
 class Retry:
@@ -1833,10 +1937,10 @@ class Retry:
                 raise ValueError('interval: negative numbers are not allowed')
             intervals = [interval]
         elif isinstance(interval, Iterable):
-            for i in interval:
+            intervals = list(interval)
+            for i in intervals:
                 if i < 0:
                     raise ValueError('interval: negative numbers are not allowed')
-            intervals = list(interval)
 
         self.max = max
         self.intervals = intervals
@@ -1875,19 +1979,3 @@ class Retry:
         number_of_intervals = len(intervals)
         index = min(number_of_intervals - 1, count)
         return intervals[index]
-
-
-class Callback:
-    def __init__(self, func: str | Callable[..., Any], timeout: Any | None = None):
-        if not isinstance(func, str) and not inspect.isfunction(func) and not inspect.isbuiltin(func):
-            raise ValueError('Callback `func` must be a string or function')
-
-        self.func = func
-        self.timeout = parse_timeout(timeout) if timeout else CALLBACK_TIMEOUT
-
-    @property
-    def name(self) -> str:
-        if isinstance(self.func, str):
-            return self.func
-        _, func_name = resolve_function_reference(self.func)
-        return func_name

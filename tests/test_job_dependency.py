@@ -1,8 +1,10 @@
 import time
 from datetime import timedelta
+from unittest import mock
 
 from redis import WatchError
 
+from rq.connections import get_connection_kwargs
 from rq.job import Dependency, Job, JobStatus, cancel_job
 from rq.queue import Queue
 from rq.registry import (
@@ -77,7 +79,7 @@ class TestJobDependency(RQTestCase):
 
     def test_job_with_dependents_delete_parent(self):
         """job.delete() deletes itself from Redis but not dependents.
-        Wthout a save, the dependent job is never saved into redis. The delete
+        Without a save, the dependent job is never saved into redis. The delete
         method will get and pass a NoSuchJobError.
         """
         queue = Queue(connection=self.connection, serializer=JSONSerializer)
@@ -137,7 +139,7 @@ class TestJobDependency(RQTestCase):
 
     def test_job_with_dependents_delete_all_with_saved(self):
         """job.delete() deletes itself from Redis. Dependents need to be
-        deleted explictely. Without a save, the dependent job is never saved
+        deleted explicitly. Without a save, the dependent job is never saved
         into redis. The delete method will get and pass a NoSuchJobError.
         """
         queue = Queue(connection=self.connection, serializer=JSONSerializer)
@@ -262,11 +264,24 @@ class TestJobDependency(RQTestCase):
         self.connection.set('some:key', b'some:value')
 
         with self.connection.pipeline() as pipe:
+            with self.assertRaises(ValueError) as context:
+                dependency.cancel(pipeline=pipe, enqueue_dependents=True)
+
+        self.assertIn('requires a watched pipeline', str(context.exception))
+        self.assertEqual(dependency.get_status(), JobStatus.QUEUED)
+        self.assertEqual(dependent.get_status(), JobStatus.DEFERRED)
+        self.assertIn(dependent.id, queue.deferred_job_registry.get_job_ids(cleanup=False))
+        self.assertNotIn(dependent.id, queue.ready_job_registry.get_job_ids(cleanup=False))
+        self.assertNotIn(dependent.id, queue.get_job_ids())
+
+        with self.connection.pipeline() as pipe:
             pipe.watch('some:key')
             self.assertEqual(self.connection.get('some:key'), b'some:value')
-            dependency.cancel(pipeline=pipe, enqueue_dependents=True)
+            dependent_job_ids_by_queue = dependency.cancel(pipeline=pipe, enqueue_dependents=True)
             pipe.set('some:key', b'some:other:value')
             pipe.execute()
+        # Caller-owned pipeline path: drain ready dependents now that EXEC committed
+        queue.enqueue_ready_jobs_by_queue(dependent_job_ids_by_queue)
         self.assertEqual(self.connection.get('some:key'), b'some:other:value')
         self.assertEqual(1, len(queue.get_jobs()))
         self.assertEqual(0, len(queue.deferred_job_registry))
@@ -278,6 +293,74 @@ class TestJobDependency(RQTestCase):
         # If job is deleted, it's also removed from CanceledJobRegistry
         dependency.delete()
         self.assertNotIn(dependency, registry)
+
+    def test_cancel_does_not_queue_dependents_before_cancel_commits(self):
+        """No dependent reaches the queue unless the cancel transaction commits."""
+        queue = Queue(connection=self.connection)
+        job_1 = queue.enqueue(fixtures.say_hello)
+        job_2 = queue.enqueue(fixtures.say_hello, depends_on=job_1)
+
+        # Raise on the last write before the cancel pipeline executes, so the transaction
+        # (including the buffered deferred→ready ops) never commits.
+        with mock.patch.object(CanceledJobRegistry, 'add', side_effect=RuntimeError()):
+            with self.assertRaises(RuntimeError):
+                job_1.cancel(enqueue_dependents=True)
+
+        # Parent cancellation never committed (get_status refreshes from Redis):
+        self.assertNotEqual(job_1.get_status(), JobStatus.CANCELED)
+        # Dependent was NOT prematurely advanced — still deferred, not moved to ready, not queued.
+        # Use cleanup=False on the ready registry: a cleanup-triggering accessor would drain it.
+        self.assertEqual(job_2.get_status(), JobStatus.DEFERRED)
+        self.assertIn(job_2.id, queue.deferred_job_registry.get_job_ids(cleanup=False))
+        self.assertNotIn(job_2.id, queue.ready_job_registry.get_job_ids(cleanup=False))
+        self.assertNotIn(job_2.id, queue.get_job_ids())
+
+    def test_cancel_post_commit_drain_failure_leaves_consistent_state(self):
+        """If draining fails after the cancel commits, the parent is canceled and the
+        dependent is parked in the ready registry (recovery itself is covered by the
+        ReadyJobRegistry cleanup tests)."""
+        queue = Queue(connection=self.connection)
+        job_1 = queue.enqueue(fixtures.say_hello)
+        job_2 = queue.enqueue(fixtures.say_hello, depends_on=job_1)
+
+        # Fail before any drain happens: CANCELED + deferred→ready have already committed.
+        with mock.patch.object(Queue, 'enqueue_ready_jobs_by_queue', side_effect=RuntimeError()):
+            with self.assertRaises(RuntimeError):
+                job_1.cancel(enqueue_dependents=True)
+
+        self.assertEqual(job_1.get_status(), JobStatus.CANCELED)
+        self.assertEqual(job_2.get_status(), JobStatus.READY_TO_ENQUEUE)
+        self.assertIn(job_2.id, queue.ready_job_registry.get_job_ids(cleanup=False))
+        self.assertNotIn(job_2.id, queue.get_job_ids())
+
+    def test_cancel_enqueue_dependents_retries_cleanly_on_watcherror(self):
+        """A single WatchError on the cancel transaction retries without double-enqueueing."""
+        queue = Queue(connection=self.connection)
+        job_1 = queue.enqueue(fixtures.say_hello)
+        job_2 = queue.enqueue(fixtures.say_hello, depends_on=job_1)
+
+        from redis.client import Pipeline
+
+        original_execute = Pipeline.execute
+        calls = {'n': 0}
+
+        def flaky_execute(self_pipe, *args, **kwargs):
+            if getattr(self_pipe, 'watching', False) and calls['n'] == 0:
+                calls['n'] += 1
+                # Real Pipeline.execute resets the pipe in a finally even on WatchError;
+                # mirror that so the cancel retry starts from a clean pipe.
+                self_pipe.reset()
+                raise WatchError('simulated contention')
+            return original_execute(self_pipe, *args, **kwargs)
+
+        with mock.patch('redis.client.Pipeline.execute', flaky_execute):
+            job_1.cancel(enqueue_dependents=True)
+
+        self.assertEqual(job_1.get_status(), JobStatus.CANCELED)
+        self.assertEqual(job_2.get_status(), JobStatus.QUEUED)
+        self.assertEqual(queue.get_job_ids().count(job_2.id), 1)
+        self.assertEqual(len(queue.deferred_job_registry), 0)
+        self.assertEqual(queue.ready_job_registry.get_job_ids(cleanup=False), [])
 
     def test_canceling_job_removes_it_from_dependency_dependents_key(self):
         """Cancel child jobs and verify their IDs are removed from the parent's dependents_key."""
@@ -446,7 +529,7 @@ class TestJobDependency(RQTestCase):
         queue = Queue(connection=self.connection)
         key = 'test_job:job_order'
 
-        connection_kwargs = self.connection.connection_pool.connection_kwargs
+        connection_kwargs = get_connection_kwargs(self.connection)
         # When there are no dependencies, the two fast jobs ("A" and "B") run in the order enqueued.
         # Worker 1 will be busy with the slow job, so worker 2 will complete both fast jobs.
         job_slow = queue.enqueue(fixtures.rpush, args=[key, 'slow', connection_kwargs, True, 0.5], job_id='slow_job')
@@ -476,7 +559,7 @@ class TestJobDependency(RQTestCase):
         """Test that jobs with dependencies are executed in the correct order."""
         queue = Queue(connection=self.connection)
         key = 'test_job:job_order'
-        connection_kwargs = self.connection.connection_pool.connection_kwargs
+        connection_kwargs = get_connection_kwargs(self.connection)
         # When there are no dependencies, the two fast jobs ("A" and "B") run in the order enqueued.
         job_slow_1 = queue.enqueue(fixtures.rpush, args=[key, 'slow_1', connection_kwargs, True, 0.5], job_id='slow_1')
         job_slow_2 = queue.enqueue(fixtures.rpush, args=[key, 'slow_2', connection_kwargs, True, 0.75], job_id='slow_2')

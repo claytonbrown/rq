@@ -8,14 +8,10 @@ from typing import Any
 
 from redis import Redis
 
-from .defaults import UNSERIALIZABLE_RETURN_VALUE_PAYLOAD
+from .defaults import RQ_KEY_PREFIX, UNSERIALIZABLE_RETURN_VALUE_PAYLOAD
 from .job import Job
 from .serializers import resolve_serializer
 from .utils import decode_redis_hash, now
-
-
-def get_key(job_id):
-    return f'rq:results:{job_id}'
 
 
 class Result:
@@ -257,7 +253,7 @@ class Result:
         If a non-zero timeout is provided, block for a result until timeout is reached.
         """
         if timeout:
-            # Unlike blpop, xread timeout is in miliseconds. "0-0" is the special value for the
+            # Unlike blpop, xread timeout is in milliseconds. "0-0" is the special value for the
             # first item in the stream, like '-' for xrevrange.
             timeout_ms = timeout * 1000
             response = job.connection.xread({cls.get_key(job.id): '0-0'}, block=timeout_ms)
@@ -279,7 +275,7 @@ class Result:
 
     @classmethod
     def get_key(cls, job_id):
-        return f'rq:results:{job_id}'
+        return f'{RQ_KEY_PREFIX}:results:{job_id}'
 
     def save(self, ttl, pipeline=None):
         """Save result data to Redis"""

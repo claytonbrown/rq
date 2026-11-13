@@ -3,14 +3,22 @@ import signal
 from multiprocessing import Process
 from time import sleep
 
-from rq.connections import parse_connection
+from rq.connections import get_connection_kwargs, parse_connection
 from rq.job import JobStatus
 from rq.queue import Queue
 from rq.serializers import JSONSerializer
 from rq.worker import SimpleWorker
 from rq.worker_pool import WorkerPool, run_worker
 from tests import RQTestCase
-from tests.fixtures import CustomJob, _send_shutdown_command, long_running_job, say_hello
+from tests.fixtures import (
+    CustomJob,
+    CustomQueue,
+    _send_shutdown_command,
+    add_meta,
+    div_by_zero,
+    long_running_job,
+    say_hello,
+)
 
 
 def wait_and_send_shutdown_signal(pid, time_to_wait=0.0):
@@ -44,7 +52,7 @@ class TestWorkerPool(RQTestCase):
 
         worker_data = list(pool.worker_dict.values())[0]
         sleep(0.5)
-        _send_shutdown_command(worker_data.name, self.connection.connection_pool.connection_kwargs.copy(), delay=0)
+        _send_shutdown_command(worker_data.name, get_connection_kwargs(self.connection), delay=0)
         # 1 worker should be dead since we sent a shutdown command
         sleep(0.75)
         pool.check_workers(respawn=False)
@@ -67,7 +75,7 @@ class TestWorkerPool(RQTestCase):
 
         worker_data = list(pool.worker_dict.values())[0]
         sleep(0.5)
-        _send_shutdown_command(worker_data.name, self.connection.connection_pool.connection_kwargs.copy(), delay=0)
+        _send_shutdown_command(worker_data.name, get_connection_kwargs(self.connection), delay=0)
         # 1 worker should be dead since we sent a shutdown command
         sleep(0.75)
         pool.reap_workers()
@@ -137,3 +145,48 @@ class TestWorkerPool(RQTestCase):
         pool.start(burst=True)
         # Worker should have processed the job
         self.assertEqual(job.get_status(refresh=True), JobStatus.FINISHED)
+
+        # Clean up
+        pool.stop_workers()
+
+    def test_exception_handlers_argument(self):
+        """Ensure exception_handlers argument is properly passed to WorkerPool"""
+        pool = WorkerPool(
+            ['default'], connection=self.connection, num_workers=1, exception_handlers=[add_meta]
+        )
+        self.assertEqual(pool.exception_handlers, [add_meta])
+
+    def test_exception_handlers_with_none(self):
+        """Ensure WorkerPool works when exception_handlers is None"""
+        pool = WorkerPool(['default'], connection=self.connection, num_workers=1, exception_handlers=None)
+        self.assertIsNone(pool.exception_handlers)
+
+    def test_exception_handlers_propagated_to_workers(self):
+        """Ensure exception_handlers are passed to workers spawned by the pool"""
+        queue = Queue('foo', connection=self.connection)
+        job = queue.enqueue(div_by_zero)
+
+        pool = WorkerPool(
+            [queue], connection=self.connection, num_workers=1, exception_handlers=[add_meta]
+        )
+        try:
+            pool.start(burst=True)
+
+            self.assertEqual(job.get_status(refresh=True), JobStatus.FAILED)
+            job.refresh()
+            self.assertEqual(job.meta, {'foo': 1})
+        finally:
+            pool.stop_workers()
+
+    def test_queue_class_propagated_to_workers(self):
+        """Ensure queue_class is passed to workers spawned by the pool"""
+        queue = CustomQueue('foo', connection=self.connection)
+        job = queue.enqueue(say_hello)
+
+        pool = WorkerPool([queue], connection=self.connection, num_workers=1, queue_class=CustomQueue)
+        try:
+            pool.start(burst=True)
+
+            self.assertEqual(job.get_status(refresh=True), JobStatus.FINISHED)
+        finally:
+            pool.stop_workers()

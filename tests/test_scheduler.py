@@ -8,16 +8,16 @@ import redis
 
 from rq import Queue
 from rq.defaults import DEFAULT_MAINTENANCE_TASK_INTERVAL
-from rq.exceptions import NoSuchJobError
-from rq.job import Job, Retry
+from rq.exceptions import NoSuchJobError, SchedulerNotFound
+from rq.job import Job, JobStatus, Retry
 from rq.registry import FinishedJobRegistry, ScheduledJobRegistry
 from rq.scheduler import RQScheduler
 from rq.serializers import JSONSerializer
-from rq.utils import current_timestamp
+from rq.utils import current_timestamp, utcformat
 from rq.worker import Worker
-from tests import RQTestCase, find_empty_redis_database, ssl_test
+from tests import RQTestCase, find_empty_redis_database, ssl_test, system_timezone
 
-from .fixtures import kill_worker, say_hello
+from .fixtures import CustomJob, CustomQueue, kill_worker, say_hello
 
 
 class CustomRedisConnection(redis.Connection):
@@ -82,54 +82,26 @@ class TestScheduledJobRegistry(RQTestCase):
         job.save()
         registry = ScheduledJobRegistry(queue=queue)
 
-        from datetime import timezone
+        # A naive datetime is local time, at the UTC offset in effect on that date:
+        # New York is UTC-5 in January and UTC-4 in July. Unique scheduling converts it the same way.
+        with system_timezone('America/New_York'):
+            for scheduled_time, timestamp in [
+                (datetime(2019, 1, 1), 1546300800 + 5 * 3600),
+                (datetime(2019, 7, 1), 1561939200 + 4 * 3600),
+            ]:
+                registry.schedule(job, scheduled_time)
+                self.assertEqual(self.connection.zscore(registry.key, job.id), timestamp)
 
-        # If we pass in a datetime with no timezone, `schedule()`
-        # assumes local timezone so depending on your local timezone,
-        # the timestamp maybe different
-        #
-        # we need to account for the difference between a timezone
-        # with DST active and without DST active.  The time.timezone
-        # property isn't accurate when time.daylight is non-zero,
-        # we'll test both.
-        #
-        # first, time.daylight == 0 (not in DST).
-        # mock the sitatuoin for American/New_York not in DST (UTC - 5)
-        # time.timezone = 18000
-        # time.daylight = 0
-        # time.altzone = 14400
+                unique_job = Job.create('myfunc', id=f'unique-{scheduled_time.month}', connection=self.connection)
+                queue.schedule_job(unique_job, scheduled_time, unique=True)
+                self.assertEqual(self.connection.zscore(registry.key, unique_job.id), timestamp)
 
-        mock_day = mock.patch('time.daylight', 0)
-        mock_tz = mock.patch('time.timezone', 18000)
-        mock_atz = mock.patch('time.altzone', 14400)
-        with mock_tz, mock_day, mock_atz:
-            registry.schedule(job, datetime(2019, 1, 1))
-            self.assertEqual(
-                self.connection.zscore(registry.key, job.id), 1546300800 + 18000
-            )  # 2019-01-01 UTC in Unix timestamp
-
-            # second, time.daylight != 0 (in DST)
-            # mock the sitatuoin for American/New_York not in DST (UTC - 4)
-            # time.timezone = 18000
-            # time.daylight = 1
-            # time.altzone = 14400
-            mock_day = mock.patch('time.daylight', 1)
-            mock_tz = mock.patch('time.timezone', 18000)
-            mock_atz = mock.patch('time.altzone', 14400)
-            with mock_tz, mock_day, mock_atz:
-                registry.schedule(job, datetime(2019, 1, 1))
-                self.assertEqual(
-                    self.connection.zscore(registry.key, job.id), 1546300800 + 14400
-                )  # 2019-01-01 UTC in Unix timestamp
-
-            # Score is always stored in UTC even if datetime is in a different tz
-            tz = timezone(timedelta(hours=7))
-            job = Job.create('myfunc', connection=self.connection)
-            job.save()
-            registry.schedule(job, datetime(2019, 1, 1, 7, tzinfo=tz))
-            self.assertEqual(
-                self.connection.zscore(registry.key, job.id), 1546300800
-            )  # 2019-01-01 UTC in Unix timestamp
+        # Score is always stored in UTC even if datetime is in a different tz
+        tz = timezone(timedelta(hours=7))
+        job = Job.create('myfunc', connection=self.connection)
+        job.save()
+        registry.schedule(job, datetime(2019, 1, 1, 7, tzinfo=tz))
+        self.assertEqual(self.connection.zscore(registry.key, job.id), 1546300800)  # 2019-01-01 UTC in Unix timestamp
 
     def test_remove_jobs(self):
         """Removing job ids from ScheduledJobRegistry. Will be deprecated in the future."""
@@ -157,6 +129,61 @@ class TestScheduler(RQTestCase):
         scheduler = RQScheduler([foo_queue, 'bar'], connection=self.connection)
         self.assertEqual(scheduler._queue_names, {'foo', 'bar'})
         self.assertEqual(scheduler.status, RQScheduler.Status.STOPPED)
+
+    def test_name(self):
+        """Scheduler generates a unique name and derives its hash key from it"""
+        scheduler = RQScheduler(['foo'], connection=self.connection)
+        self.assertTrue(scheduler.name)
+        self.assertEqual(scheduler.key, f'rq:scheduler:{scheduler.name}')
+
+        # An explicitly provided name is honored
+        named = RQScheduler(['foo'], connection=self.connection, name='my-scheduler')
+        self.assertEqual(named.name, 'my-scheduler')
+
+    def test_register_birth_and_fetch(self):
+        """register_birth() writes a metadata hash that fetch() round-trips"""
+        scheduler = RQScheduler(['foo', 'bar'], connection=self.connection)
+        scheduler.register_birth()
+
+        data = self.connection.hgetall(scheduler.key)
+        self.assertEqual(int(data[b'pid']), os.getpid())
+        self.assertIsNotNone(scheduler.last_heartbeat)
+        # The hash carries a TTL
+        self.assertTrue(scheduler.interval + 55 <= self.connection.ttl(scheduler.key) <= scheduler.interval + 60)
+
+        fetched = RQScheduler.fetch(scheduler.name, self.connection)
+        self.assertEqual(fetched.name, scheduler.name)
+        self.assertEqual(fetched.hostname, scheduler.hostname)
+        self.assertEqual(fetched.pid, scheduler.pid)
+        self.assertEqual(fetched._queue_names, {'foo', 'bar'})
+        self.assertEqual(fetched.created_at, scheduler.created_at)
+        self.assertEqual(fetched.last_heartbeat, scheduler.last_heartbeat)
+
+        self.connection.delete(scheduler.key)
+        scheduler.save()
+        self.assertEqual(self.connection.hget(scheduler.key, 'name').decode(), scheduler.name)
+
+    def test_register_birth_is_idempotent(self):
+        """register_birth() can be called again (e.g. on restart) without error"""
+        scheduler = RQScheduler(['foo'], connection=self.connection)
+        scheduler.register_birth()
+        scheduler.register_birth()  # must not raise
+        self.assertTrue(self.connection.exists(scheduler.key))
+
+    def test_fetch_missing_scheduler_raises(self):
+        """fetch() raises SchedulerNotFound when no metadata hash exists"""
+        with self.assertRaises(SchedulerNotFound):
+            RQScheduler.fetch('does-not-exist', self.connection)
+
+    def test_register_death(self):
+        """register_death() returns whether the metadata hash was deleted"""
+        scheduler = RQScheduler(['foo'], connection=self.connection)
+        scheduler.register_birth()
+        self.assertTrue(self.connection.exists(scheduler.key))
+
+        self.assertTrue(scheduler.register_death())
+        self.assertFalse(self.connection.exists(scheduler.key))
+        self.assertFalse(scheduler.register_death())
 
     def test_should_reacquire_locks(self):
         """scheduler.should_reacquire_locks works properly"""
@@ -186,17 +213,53 @@ class TestScheduler(RQTestCase):
 
         self.assertEqual(scheduler.acquire_locks(), {name_1})
         self.assertEqual(scheduler._acquired_locks, {name_1})
-        self.assertEqual(scheduler.acquire_locks(), set())
+        # A second call refreshes the lock held by the same scheduler
+        self.assertEqual(scheduler.acquire_locks(), {name_1})
 
-        # Only name_2 is returned since name_1 is already locked
+        # Only name_2 is returned since name_1 is locked by another scheduler
         scheduler = RQScheduler([name_1, name_2], self.connection)
         self.assertEqual(scheduler.acquire_locks(), {name_2})
         self.assertEqual(scheduler._acquired_locks, {name_2})
 
-        # When a new lock is successfully acquired, _acquired_locks is added
+        # name_2 is refreshed while name_3 is newly acquired
         scheduler._queue_names.add(name_3)
-        self.assertEqual(scheduler.acquire_locks(), {name_3})
+        self.assertEqual(scheduler.acquire_locks(), {name_2, name_3})
         self.assertEqual(scheduler._acquired_locks, {name_2, name_3})
+
+    def test_lock_acquisition_drops_taken_locks(self):
+        """acquire_locks() drops locks overwritten by another scheduler and leaves them untouched"""
+        name = 'lock-test-taken'
+        scheduler = RQScheduler([name], self.connection)
+        locking_key = scheduler.get_locking_key(name)
+
+        self.assertEqual(scheduler.acquire_locks(), {name})
+        self.connection.set(locking_key, 'other-scheduler', ex=5)
+
+        self.assertEqual(scheduler.acquire_locks(), set())
+        self.assertEqual(scheduler._acquired_locks, set())
+
+        # The other scheduler's token is still in place and its TTL was not extended or removed
+        self.assertEqual(self.connection.get(locking_key), b'other-scheduler')
+        ttl = self.connection.ttl(locking_key)
+        self.assertGreater(ttl, 0)
+        self.assertLessEqual(ttl, 5)
+
+        # With no verified locks, auto_start doesn't fork a scheduler process
+        scheduler.acquire_locks(auto_start=True)
+        self.assertIsNone(scheduler._process)
+
+    def test_lock_acquisition_refreshes_own_token(self):
+        """acquire_locks() keeps a lock still holding this scheduler's token and refreshes its TTL"""
+        name = 'lock-test-refresh'
+        scheduler = RQScheduler([name], self.connection)
+        locking_key = scheduler.get_locking_key(name)
+
+        self.assertEqual(scheduler.acquire_locks(), {name})
+        self.connection.expire(locking_key, 5)
+
+        self.assertEqual(scheduler.acquire_locks(), {name})
+        self.assertEqual(scheduler._acquired_locks, {name})
+        self.assertGreaterEqual(self.connection.ttl(locking_key), 55)
 
     def test_lock_acquisition_with_auto_start(self):
         """Test lock acquisition with auto_start=True"""
@@ -254,17 +317,19 @@ class TestScheduler(RQTestCase):
 
     def test_queue_scheduler_pid(self):
         queue = Queue(connection=self.connection)
-        scheduler = RQScheduler(
-            [
-                queue,
-            ],
-            connection=self.connection,
-        )
+        scheduler = RQScheduler([queue], connection=self.connection)
         scheduler.acquire_locks()
+
+        # The lock value is the scheduler's name
+        self.assertEqual(self.connection.get(scheduler.get_locking_key(queue.name)).decode(), scheduler.name)
+        # Until register_birth() writes the metadata hash, the pid is unknown
+        self.assertIsNone(queue.scheduler_pid)
+
+        scheduler.register_birth()
         assert queue.scheduler_pid == os.getpid()
 
     def test_heartbeat(self):
-        """Test that heartbeat updates locking keys TTL"""
+        """Test that heartbeat updates the locking keys' TTL and the scheduler's metadata"""
         name_1 = 'lock-test-1'
         name_2 = 'lock-test-2'
         name_3 = 'lock-test-3'
@@ -272,6 +337,7 @@ class TestScheduler(RQTestCase):
         scheduler.acquire_locks()
         scheduler = RQScheduler([name_1, name_2, name_3], self.connection)
         scheduler.acquire_locks()
+        scheduler.register_birth()
 
         locking_key_1 = RQScheduler.get_locking_key(name_1)
         locking_key_2 = RQScheduler.get_locking_key(name_2)
@@ -282,19 +348,27 @@ class TestScheduler(RQTestCase):
             pipeline.expire(locking_key_2, 1000)
             pipeline.expire(locking_key_3, 1000)
             pipeline.execute()
+        self.connection.expire(scheduler.key, 1000)
 
         scheduler.heartbeat()
         self.assertEqual(self.connection.ttl(locking_key_1), 61)
         self.assertEqual(self.connection.ttl(locking_key_2), 61)
         self.assertEqual(self.connection.ttl(locking_key_3), 1000)
 
-        # scheduler.stop() releases locks and sets status to STOPPED
+        # heartbeat() also advances last_heartbeat and refreshes the metadata hash TTL
+        self.assertIsNotNone(scheduler.last_heartbeat)
+        stored = self.connection.hget(scheduler.key, 'last_heartbeat')
+        self.assertEqual(stored.decode(), utcformat(scheduler.last_heartbeat))
+        self.assertTrue(scheduler.interval + 55 <= self.connection.ttl(scheduler.key) <= scheduler.interval + 60)
+
+        # scheduler.stop() releases locks, sets status to STOPPED, and deletes the metadata hash
         scheduler._status = scheduler.Status.WORKING
         scheduler.stop()
         self.assertFalse(self.connection.exists(locking_key_1))
         self.assertFalse(self.connection.exists(locking_key_2))
         self.assertTrue(self.connection.exists(locking_key_3))
         self.assertEqual(scheduler.status, scheduler.Status.STOPPED)
+        self.assertFalse(self.connection.exists(scheduler.key))
 
         # Heartbeat also works properly for schedulers with a single queue
         scheduler = RQScheduler([name_1], self.connection)
@@ -302,6 +376,59 @@ class TestScheduler(RQTestCase):
         self.connection.expire(locking_key_1, 1000)
         scheduler.heartbeat()
         self.assertEqual(self.connection.ttl(locking_key_1), 61)
+
+    def test_heartbeat_updates_acquired_locks(self):
+        """heartbeat() keeps owned and expired locks but drops locks taken by another scheduler.
+        Redis-level lock effects are covered by the script tests in test_scripts.py."""
+        scheduler = RQScheduler(['hb-owned', 'hb-expired', 'hb-taken'], self.connection)
+        scheduler.acquire_locks()
+        scheduler.register_birth()
+        scheduler.prepare_registries()
+
+        self.connection.delete(scheduler.get_locking_key('hb-expired'))
+        self.connection.set(scheduler.get_locking_key('hb-taken'), 'another-scheduler', ex=5)
+
+        scheduler.heartbeat()
+        self.assertEqual(scheduler._acquired_locks, {'hb-owned', 'hb-expired'})
+        self.assertEqual(scheduler._scheduled_job_registries, [])
+
+        scheduler.release_locks()
+        scheduler.register_death()
+
+    def test_release_locks_leaves_taken_lock(self):
+        """release_locks() does not delete a lock this scheduler no longer owns"""
+        name = 'release-taken'
+        scheduler = RQScheduler([name], self.connection)
+        scheduler.acquire_locks()
+        locking_key = scheduler.get_locking_key(name)
+
+        # The lock changes owners while this scheduler still believes it owns it
+        self.connection.set(locking_key, 'another-scheduler', ex=5)
+
+        scheduler.release_locks()
+        self.assertEqual(scheduler._acquired_locks, set())
+        self.assertEqual(self.connection.get(locking_key), b'another-scheduler')
+
+    def test_work_heartbeats_before_enqueuing(self):
+        """work() verifies locks via heartbeat() before enqueuing scheduled jobs"""
+        scheduler = RQScheduler(['work-loop-order'], self.connection)
+        scheduler.acquire_locks()
+        calls = []
+
+        def stop_after_first_iteration(interval):
+            scheduler._stop_requested = True
+
+        with (
+            mock.patch.object(scheduler, 'heartbeat', side_effect=lambda: calls.append('heartbeat')),
+            mock.patch.object(scheduler, 'enqueue_scheduled_jobs', side_effect=lambda: calls.append('enqueue')),
+            mock.patch('rq.scheduler.time.sleep', side_effect=stop_after_first_iteration),
+        ):
+            scheduler.work()
+
+        self.assertEqual(calls, ['heartbeat', 'enqueue'])
+        # stop() ran: locks released and the metadata hash deleted
+        self.assertEqual(scheduler._acquired_locks, set())
+        self.assertFalse(self.connection.exists(scheduler.key))
 
     def test_enqueue_scheduled_jobs(self):
         """Scheduler can enqueue scheduled jobs"""
@@ -350,6 +477,20 @@ class TestWorker(RQTestCase):
         worker.work(burst=True, with_scheduler=True)
         assert worker.scheduler
         self.assertIsNone(self.connection.get(worker.scheduler.get_locking_key('default')))
+        # The birth/death pair leaves no metadata hash behind
+        self.assertFalse(self.connection.exists(worker.scheduler.key))
+
+    def test_work_burst_scheduler_cleans_up_on_error(self):
+        """If enqueue_scheduled_jobs() raises in burst, the lock and metadata hash are still released"""
+        queue = Queue(connection=self.connection)
+        worker = Worker(queues=[queue], connection=self.connection)
+        with mock.patch.object(RQScheduler, 'enqueue_scheduled_jobs', side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                worker.work(burst=True, with_scheduler=True)
+
+        assert worker.scheduler
+        self.assertIsNone(self.connection.get(worker.scheduler.get_locking_key('default')))
+        self.assertFalse(self.connection.exists(worker.scheduler.key))
 
     @mock.patch.object(RQScheduler, 'acquire_locks')
     def test_run_maintenance_tasks(self, mocked):
@@ -414,6 +555,32 @@ class TestWorker(RQTestCase):
         registry = FinishedJobRegistry(queue=queue)
         self.assertEqual(len(registry), 1)
 
+    def test_work_burst_with_job_class(self):
+        """The scheduler fetches scheduled jobs with the worker's job_class"""
+        with mock.patch.object(CustomJob, 'redis_job_namespace_prefix', 'custom:job:'):
+            queue = Queue(connection=self.connection, job_class=CustomJob)
+            job = queue.enqueue_at(datetime(2019, 1, 1, tzinfo=timezone.utc), say_hello)
+            self.assertEqual(job.get_status(), JobStatus.SCHEDULED)
+
+            worker = Worker([queue], connection=self.connection, job_class=CustomJob)
+            worker.work(burst=True, with_scheduler=True)
+
+            job.refresh()
+            self.assertEqual(job.get_status(), JobStatus.FINISHED)
+            self.assertEqual(len(ScheduledJobRegistry(queue=queue)), 0)
+            self.assertIn(job.id, FinishedJobRegistry(queue=queue, job_class=CustomJob).get_job_ids())
+
+    def test_work_burst_with_queue_class(self):
+        """The scheduler enqueues due jobs with the worker's queue_class"""
+        queue = CustomQueue(connection=self.connection)
+        job = queue.enqueue_at(datetime(2019, 1, 1, tzinfo=timezone.utc), say_hello)
+
+        worker = Worker([queue], connection=self.connection, queue_class=CustomQueue)
+        worker.work(burst=True, with_scheduler=True)
+
+        self.assertEqual(job.get_status(refresh=True), JobStatus.FINISHED)
+        self.assertEqual(self.connection.llen('rq:queue:default'), 0)
+
     def test_work_with_serializer(self):
         queue = Queue(connection=self.connection, serializer=JSONSerializer)
         worker = Worker(queues=[queue], connection=self.connection, serializer=JSONSerializer)
@@ -448,6 +615,29 @@ class TestQueue(RQTestCase):
         scheduler.enqueue_scheduled_jobs()
         self.assertEqual(len(queue), 1)
         self.assertEqual(len(registry), 0)
+
+    def test_enqueue_at_with_pipeline(self):
+        """queue.enqueue_at() with a pipeline schedules the job when the pipeline is executed"""
+        queue = Queue(connection=self.connection)
+        registry = ScheduledJobRegistry(queue=queue)
+        scheduler = RQScheduler([queue], connection=self.connection)
+        scheduler.acquire_locks()
+
+        # Discarding the pipeline writes nothing
+        pipeline = self.connection.pipeline()
+        job = queue.enqueue_at(datetime(2019, 1, 1, tzinfo=timezone.utc), say_hello, pipeline=pipeline)
+        pipeline.reset()
+        self.assertFalse(self.connection.exists(job.key))
+        self.assertEqual(len(registry), 0)
+
+        # A scheduler run before the pipeline is executed doesn't lose the job
+        pipeline = self.connection.pipeline()
+        job = queue.enqueue_at(datetime(2019, 1, 1, tzinfo=timezone.utc), say_hello, pipeline=pipeline)
+        scheduler.enqueue_scheduled_jobs()
+        pipeline.execute()
+        self.assertIn(job.id, registry)
+        scheduler.enqueue_scheduled_jobs()
+        self.assertEqual(queue.job_ids, [job.id])
 
     def test_enqueue_at_at_front(self):
         """queue.enqueue_at() accepts at_front argument. When true, job will be put at position 0

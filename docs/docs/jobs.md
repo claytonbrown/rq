@@ -32,6 +32,8 @@ The status of a job can be one of the following:
 * `failed`: Jobs that encountered errors during execution or expired before being executed.
 * `started`: The job has started execution. This status includes the job execution support mechanisms, such as setting the worker name and setting up heartbeat information.
 * `deferred`: The job is not ready for execution because its dependencies have not finished successfully yet.
+* `rate_limited`: The job is waiting for capacity under a concurrency rate limit. It exists in Redis but is not placed on a queue or included in queue counts until capacity becomes available.
+* `ready_to_enqueue`: An internal, transient status for a job whose dependencies have completed and that is about to be enqueued. Jobs pass through it briefly during dependency resolution and crash recovery; it is not user-actionable.
 * `scheduled`: Jobs created to run at a future date or jobs that are retried after a retry interval.
 * `stopped`: The job was stopped because the worker was stopped.
 * `canceled`: The job has been manually canceled and will not be executed, even if it is part of a dependency chain.
@@ -327,7 +329,7 @@ job = q.enqueue(count_words_at_url,
 
 ## Job Position in Queue
 
-For user feedback or debuging it is possible to get the position of a job
+For user feedback or debugging it is possible to get the position of a job
 within the work queue. This allows to track the job processing through the
 queue.
 

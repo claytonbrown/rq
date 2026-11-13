@@ -502,10 +502,32 @@ def split_list(a_list: Sequence[_T], segment_size: int) -> Generator[Sequence[_T
         segment_size (int): The segment size to split into
 
     Yields:
-        list: The splitted listed
+        Sequence[Any]: A slice of the input sequence
     """
     for i in range(0, len(a_list), segment_size):
         yield a_list[i : i + segment_size]
+
+
+def missing_keys(connection: Redis, keys: Sequence[str]) -> list[str]:
+    """Returns the keys that do not exist in Redis.
+
+    One multi key EXISTS covers the common case where every key is alive.
+    Only when some are missing is each key checked on its own.
+
+    Args:
+        connection (Redis): The Redis connection
+        keys (Sequence[str]): The keys to check
+
+    Returns:
+        list: The keys that do not exist
+    """
+    if not keys or connection.exists(*keys) == len(keys):
+        return []
+    with connection.pipeline() as pipeline:
+        for key in keys:
+            pipeline.exists(key)
+        results = pipeline.execute()
+    return [key for key, key_exists in zip(keys, results) if not key_exists]
 
 
 def truncate_long_string(data: str, max_length: int | None = None) -> str:

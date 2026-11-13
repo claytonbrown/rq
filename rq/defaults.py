@@ -1,3 +1,24 @@
+import os
+import re
+
+
+def validate_key_prefix(prefix: str) -> str:
+    """Return `prefix` if it is safe to use as RQ_KEY_PREFIX, else raise ValueError.
+
+    The prefix is spliced into %-templates, str.format() templates and Lua source, so only allow safe characters.
+    """
+    if not re.fullmatch(r'[A-Za-z0-9_.:/{}-]+', prefix):
+        raise ValueError(f'Invalid RQ_KEY_PREFIX {prefix!r}: only letters, digits, and _ . : / - {{ }} are allowed')
+    return prefix
+
+
+RQ_KEY_PREFIX = validate_key_prefix(os.environ.get('RQ_KEY_PREFIX', 'rq'))
+"""The prefix used for all Redis keys managed by RQ.
+Override via the RQ_KEY_PREFIX environment variable before importing rq."""
+
+FORMAT_KEY_PREFIX = RQ_KEY_PREFIX.replace('{', '{{').replace('}', '}}')
+"""Prefix with braces escaped for templates consumed by `str.format()`."""
+
 DEFAULT_JOB_CLASS = 'rq.job.Job'
 """ The path for the default Job class to use.
 Defaults to the main `Job` class within the `rq.job` module
@@ -52,6 +73,24 @@ DEFAULT_FAILURE_TTL = 31536000
 Means that the failure information will be expired from Redis
 after `DEFAULT_FAILURE_TTL` seconds.
 Defaults to 1 YEAR in seconds
+"""
+
+
+DEFAULT_CRON_JOB_HISTORY_LIMIT = 1000
+""" The maximum number of spawned job IDs to keep in a cron job's history
+"""
+
+
+DEFAULT_CRON_JOB_HISTORY_TTL = 31536000
+""" The Time To Live (TTL) in seconds to keep a cron job's history of spawned jobs.
+Refreshed on every write, so history expires if the cron job spawns no jobs for 1 YEAR
+"""
+
+
+DEFAULT_CRON_SCHEDULER_TTL = 120
+""" The Time To Live (TTL) in seconds for a CronScheduler's Redis hash.
+Refreshed on every heartbeat. Also used as the staleness threshold when
+pruning dead schedulers from the scheduler registry.
 """
 
 

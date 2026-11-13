@@ -56,14 +56,13 @@ class WorkerPool:
         serializer: Serializer = DefaultSerializer,
         job_class: type[Job] = Job,
         queue_class: type[Queue] = Queue,
+        exception_handlers=None,
         *args,
         **kwargs,
     ):
         self.num_workers: int = num_workers
         self._workers: list[Worker] = []
-        setup_loghandlers('INFO', DEFAULT_LOGGING_DATE_FORMAT, DEFAULT_LOGGING_FORMAT, name=__name__)
         self.log: logging.Logger = logging.getLogger(__name__)
-        # self.log: logging.Logger = logger
         self._queue_names: list[str] = parse_names(queues)
         self.connection = connection
         self.name: str = uuid4().hex
@@ -74,6 +73,7 @@ class WorkerPool:
         self.serializer: Serializer = serializer
         self.job_class: type[Job] = job_class
         self.queue_class: type[Queue] = queue_class
+        self.exception_handlers = exception_handlers
 
         # A dictionary of WorkerData keyed by worker name
         self.worker_dict: dict[str, WorkerData] = {}
@@ -173,7 +173,9 @@ class WorkerPool:
                 'logging_level': logging_level,
                 'worker_class': self.worker_class,
                 'job_class': self.job_class,
+                'queue_class': self.queue_class,
                 'serializer': self.serializer,
+                'exception_handlers': self.exception_handlers,
             },
             name=f'Worker {name} (WorkerPool {self.name})',
         )
@@ -262,6 +264,7 @@ def run_worker(
     serializer: Serializer = DefaultSerializer,
     job_class: type[Job] = Job,
     queue_class: type[Queue] = Queue,
+    exception_handlers=None,
     burst: bool = True,
     logging_level: str = 'INFO',
     _sleep: int = 0,
@@ -277,6 +280,7 @@ def run_worker(
         serializer=serializer,
         job_class=job_class,
         queue_class=queue_class,
+        exception_handlers=exception_handlers,
     )
     worker.log.info('Starting worker started with PID %s', os.getpid())
     time.sleep(_sleep)

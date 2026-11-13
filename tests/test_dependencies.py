@@ -1,6 +1,7 @@
 from multiprocessing import Process
 
 from rq import Queue, SimpleWorker, Worker
+from rq.connections import get_connection_kwargs
 from rq.job import Dependency, Job, JobStatus
 from rq.utils import current_timestamp
 from tests import RQTestCase
@@ -120,7 +121,7 @@ class TestDependencies(RQTestCase):
         job = Job.fetch(job.id, connection=self.connection)
         self.assertEqual(job.get_status(), JobStatus.FINISHED)
 
-        # Test dependant is enqueued at front
+        # Test dependent is enqueued at front
         q.empty()
         parent_job = q.enqueue(say_hello)
         q.enqueue(say_hello, job_id='fake_job_id_1', depends_on=Dependency(jobs=[parent_job]))
@@ -149,6 +150,36 @@ class TestDependencies(RQTestCase):
         self.assertEqual(jobs[0].get_status(), JobStatus.QUEUED)
         q.empty()
 
+    def test_enqueue_many_at_front_with_met_dependencies(self):
+        """enqueue_many() honors at_front for jobs whose dependencies are already met, as enqueue() does"""
+        q = Queue(connection=self.connection)
+        parent_job = q.enqueue(say_hello)
+        SimpleWorker([q], connection=q.connection).work(burst=True)
+        q.enqueue(say_hello, job_id='waiting')
+        q.enqueue_many(
+            [
+                Queue.prepare_data(say_hello, job_id='front', depends_on=parent_job, at_front=True),
+                Queue.prepare_data(say_hello, job_id='back', depends_on=parent_job),
+            ]
+        )
+        self.assertEqual(q.job_ids, ['front', 'waiting', 'back'])
+
+    def test_enqueue_many_deferred_job_ttl(self):
+        """enqueue_many() makes deferred jobs expire after their ttl, as enqueue() does"""
+        q = Queue(connection=self.connection)
+        parent_job = q.enqueue(say_hello)
+        jobs = q.enqueue_many(
+            [
+                Queue.prepare_data(say_hello, depends_on=parent_job, ttl=100),
+                Queue.prepare_data(say_hello, depends_on=parent_job),
+            ]
+        )
+        self.assertEqual(jobs[0].get_status(), JobStatus.DEFERRED)
+        self.assertTrue(0 < self.connection.ttl(jobs[0].key) <= 100)
+        self.assertTrue(0 < self.connection.ttl(jobs[0].dependencies_key) <= 100)
+        # A job without ttl doesn't expire
+        self.assertEqual(self.connection.ttl(jobs[1].key), -1)
+
     def test_dependency_list_in_depends_on(self):
         """Enqueue with Dependency list in depends_on"""
         q = Queue(connection=self.connection)
@@ -162,7 +193,7 @@ class TestDependencies(RQTestCase):
         self.assertEqual(job.get_status(), JobStatus.FINISHED)
 
     def test_enqueue_job_dependency(self):
-        """Enqueue via Queue.enqueue_job() with depencency"""
+        """Enqueue via Queue.enqueue_job() with dependency"""
         q = Queue(connection=self.connection)
         w = SimpleWorker([q], connection=q.connection)
 
@@ -232,9 +263,9 @@ class TestDependencies(RQTestCase):
         job_c = queue.enqueue(check_dependencies_are_met, job_id='C', depends_on=['A', 'B'])
 
         job_c.dependencies_are_met()
-        w = Worker([queue], connection=self.connection)
+        w = SimpleWorker([queue], connection=self.connection)
         w.work(burst=True)
-        assert job_c.result
+        assert job_c.return_value(refresh=True)
 
     def test_allow_failures_when_work_horse_killed(self):
         """Ensure that allow_failure is respected when a worker is killed"""
@@ -243,7 +274,7 @@ class TestDependencies(RQTestCase):
         job2 = queue.enqueue(say_hello, depends_on=Dependency(jobs=job, allow_failure=True))
 
         # Wait 1 second before killing the horse to simulate horse terminating unexpectedly
-        p = Process(target=kill_horse, args=('horse_pid_key', self.connection.connection_pool.connection_kwargs, 1))
+        p = Process(target=kill_horse, args=('horse_pid_key', get_connection_kwargs(self.connection), 1))
         p.start()
 
         worker = Worker([queue], connection=self.connection)
@@ -251,6 +282,32 @@ class TestDependencies(RQTestCase):
 
         self.assertEqual(job.get_status(), JobStatus.FAILED)
         self.assertEqual(job2.get_status(), JobStatus.FINISHED)
+
+    def test_allow_failure_when_dependency_has_already_failed(self):
+        """A job that allows its dependencies to fail is enqueued if they have already failed"""
+        q = Queue(connection=self.connection)
+        w = SimpleWorker([q], connection=q.connection)
+        parent_job = q.enqueue(div_by_zero)
+        w.work(burst=True)
+        self.assertEqual(parent_job.get_status(), JobStatus.FAILED)
+
+        job = q.enqueue(say_hello, depends_on=Dependency(jobs=parent_job, allow_failure=True))
+        self.assertEqual(job.get_status(), JobStatus.QUEUED)
+        self.assertEqual(q.job_ids, [job.id])
+
+        # Without allow_failure, the job is still deferred
+        deferred_job = q.enqueue(say_hello, depends_on=Dependency(jobs=parent_job))
+        self.assertEqual(deferred_job.get_status(), JobStatus.DEFERRED)
+
+        # The job still waits for a dependency that hasn't finished yet
+        other_parent_job = q.enqueue(say_hello)
+        job_2 = q.enqueue(say_hello, depends_on=Dependency(jobs=[parent_job, other_parent_job], allow_failure=True))
+        self.assertEqual(job_2.get_status(), JobStatus.DEFERRED)
+
+        w.work(burst=True)
+        self.assertEqual(job.get_status(), JobStatus.FINISHED)
+        self.assertEqual(job_2.get_status(), JobStatus.FINISHED)
+        self.assertEqual(deferred_job.get_status(), JobStatus.DEFERRED)
 
     def test_dependency_accepts_single_job(self):
         """Test that Dependency constructor accepts a single Job instance"""

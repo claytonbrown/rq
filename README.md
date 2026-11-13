@@ -126,6 +126,18 @@ job = queue.enqueue(send_email, user_id, job_id='welcome-42', unique=True)
 
 More details can be found in the [docs](https://python-rq.org/docs/#unique-jobs).
 
+## Rate Limiting
+
+RQ 2.11.0 adds concurrency-based rate limits for jobs sharing a key:
+
+```python
+from rq import RateLimit
+
+queue.enqueue(generate_report, rate_limit=RateLimit(key='reports', concurrency=2))
+```
+
+More details can be found in the [docs](https://python-rq.org/docs/#concurrency-rate-limits).
+
 ## Retrying Failed Jobs
 
 Retrying failed jobs is also supported:
@@ -141,6 +153,24 @@ queue.enqueue(say_hello, retry=Retry(max=3, interval=[10, 30, 60]))
 ```
 
 For a more complete example, refer to the [docs][d].  But this is the essence.
+
+## Webhooks
+
+RQ can send an HTTP request to a URL when a job finishes or fails, without writing a callback function:
+
+```python
+from rq import Webhook
+
+queue.enqueue(
+    say_hello,
+    webhooks=[
+        Webhook('https://example.com/finished', job_status='finished'),
+        Webhook('https://example.com/failed', job_status='failed', method='POST'),
+    ],
+)
+```
+
+More details can be found in the [docs](https://python-rq.org/docs/#webhooks).
 
 ## Interval and Cron Job Scheduling
 
@@ -198,7 +228,23 @@ cron.register(
     queue_name='reports',
     cron='0 8 1 * *'
 )
+
+Cron jobs can also send webhooks to a monitoring endpoint when a scheduled run finishes or fails:
+
 ```python
+from rq import cron, Webhook
+
+# Ping a monitoring endpoint after the nightly backup finishes or fails
+cron.register(
+    backup_database,
+    queue_name='maintenance',
+    cron='0 3 * * *',
+    webhooks=[
+        Webhook('https://example.com/finished', 'finished'),
+        Webhook('https://example.com/failed', 'failed'),
+    ],
+)
+```
 
 More details on functionality can be found in the [docs](https://python-rq.org/docs/cron/).
 
@@ -268,9 +314,6 @@ If you use RQ, Check out these below repos which might be useful in your rq base
 
 - [django-rq](https://github.com/rq/django-rq)
 - [rq-dashboard](https://github.com/Parallels/rq-dashboard)
-- [rqmonitor](https://github.com/pranavgupta1234/rqmonitor)
-- [Flask-RQ2](https://github.com/rq/Flask-RQ2)
-- [rq-scheduler](https://github.com/rq/rq-scheduler)
 - [rq-dashboard-fastAPI](https://github.com/Hannes221/rq-dashboard-fast)
 
 

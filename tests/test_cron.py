@@ -11,11 +11,14 @@ from unittest.mock import patch
 
 from redis import Redis
 
-from rq import Queue, utils
+from rq import Queue, cron, utils
+from rq.connections import get_connection_kwargs
 from rq.cron import CronJob, CronScheduler, _job_data_registry
 from rq.cron_scheduler_registry import get_keys, get_registry_key
+from rq.defaults import DEFAULT_CRON_SCHEDULER_TTL
 from rq.exceptions import SchedulerNotFound
-from tests import RQTestCase
+from rq.webhook import Webhook
+from tests import RQTestCase, system_timezone
 from tests.fixtures import div_by_zero, do_nothing, say_hello
 
 
@@ -221,6 +224,33 @@ class TestCronScheduler(RQTestCase):
         self.assertEqual(cron_job.job_options['result_ttl'], result_ttl)
         self.assertEqual(cron_job.job_options['meta'], meta)
 
+    def test_register_with_webhooks(self):
+        """scheduler.register() stores webhooks and validates them immediately"""
+        scheduler = CronScheduler(connection=self.connection)
+        webhooks = [Webhook('http://example.com/done', 'finished')]
+
+        cron_job = scheduler.register(func=say_hello, queue_name=self.queue_name, interval=30, webhooks=webhooks)
+        self.assertEqual(cron_job.job_options['webhooks'], webhooks)
+
+        # Direct registration fails fast on invalid webhooks
+        with self.assertRaises(TypeError):
+            scheduler.register(func=say_hello, queue_name=self.queue_name, interval=30, webhooks=['bad'])
+
+    def test_module_register_forwards_webhooks(self):
+        """cron.register() carries webhooks into job_data and reach the enqueued job"""
+        webhooks = [Webhook('http://example.com/done', 'finished')]
+
+        job_data = cron.register(say_hello, queue_name=self.queue_name, interval=60, webhooks=webhooks)
+        self.assertEqual(job_data['webhooks'], webhooks)
+
+        scheduler = cron.create_cron(self.connection)
+        self.assertEqual(scheduler.get_jobs()[0].job_options['webhooks'], webhooks)
+
+        scheduler.enqueue_jobs()
+        jobs = Queue(self.queue_name, connection=self.connection).get_jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].webhooks, webhooks)
+
     def test_load_config_from_file_method(self):  # Renamed test
         """Test loading cron configuration using the instance method"""
         # Create a Cron instance first
@@ -301,6 +331,17 @@ class TestCronScheduler(RQTestCase):
         finally:
             os.remove(invalid_file_path)  # Clean up temp file
 
+    def test_create_cron_consumes_registry(self):
+        """create_cron consumes the global registry, so a second call registers nothing new"""
+        cron.register(say_hello, queue_name=self.queue_name, interval=60)
+
+        first_scheduler = cron.create_cron(self.connection)
+        self.assertEqual(len(first_scheduler.get_jobs()), 1)
+        self.assertEqual(len(_job_data_registry), 0, 'Registry not consumed by create_cron')
+
+        second_scheduler = cron.create_cron(self.connection)
+        self.assertEqual(len(second_scheduler.get_jobs()), 0)
+
     @patch('rq.cron.time.sleep')
     @patch('rq.cron.CronScheduler.calculate_sleep_interval')
     @patch('rq.cron.CronScheduler.enqueue_jobs')
@@ -365,13 +406,14 @@ class TestCronScheduler(RQTestCase):
         self.assertIsNone(job2.latest_enqueue_time)
         self.assertIsNotNone(job2.next_enqueue_time)
 
+    @system_timezone('UTC')
     @patch('rq.cron.now')
     def test_cron_jobs_run_when_scheduled_time_arrives(self, mock_now):
         """Test that cron jobs run when their scheduled time arrives"""
         scheduler = CronScheduler(connection=self.connection)
 
         # Set current time to 8:59 AM (1 minute before 9 AM)
-        current_time = datetime(2023, 10, 27, 8, 59, 0)
+        current_time = datetime(2023, 10, 27, 8, 59, 0, tzinfo=timezone.utc)
         mock_now.return_value = current_time
 
         # Register job scheduled for 9 AM daily
@@ -388,7 +430,7 @@ class TestCronScheduler(RQTestCase):
         self.assertIsNotNone(job.next_enqueue_time)
 
         # Now advance time to exactly 9 AM
-        scheduled_time = datetime(2023, 10, 27, 9, 0, 0)
+        scheduled_time = datetime(2023, 10, 27, 9, 0, 0, tzinfo=timezone.utc)
         mock_now.return_value = scheduled_time
 
         # Now the job should run
@@ -405,20 +447,21 @@ class TestCronScheduler(RQTestCase):
         self.assertEqual(job.latest_enqueue_time, scheduled_time)
         self.assertIsNotNone(job.next_enqueue_time)
         # Next run should be tomorrow at 9 AM
-        expected_next_run = datetime(2023, 10, 28, 9, 0, 0)
+        expected_next_run = datetime(2023, 10, 28, 9, 0, 0, tzinfo=timezone.utc)
         self.assertEqual(job.next_enqueue_time, expected_next_run)
 
         # Verify the actual queued job has correct function
         queued_job = queue.get_jobs()[0]
         self.assertEqual(queued_job.func_name, 'tests.fixtures.say_hello')
 
+    @system_timezone('UTC')
     @patch('rq.cron.now')
     def test_multiple_cron_jobs_selective_execution(self, mock_now):
         """Test that only cron jobs whose time has arrived are executed"""
         scheduler = CronScheduler(connection=self.connection)
 
         # Set current time to 8:15 AM
-        mock_now.return_value = datetime(2023, 10, 27, 8, 15, 0)
+        mock_now.return_value = datetime(2023, 10, 27, 8, 15, 0, tzinfo=timezone.utc)
 
         # Register multiple jobs with different schedules
         job_9am = scheduler.register(
@@ -442,14 +485,14 @@ class TestCronScheduler(RQTestCase):
 
         # At 8:30 AM, only the 30-minute job should be ready
         # (assuming it last ran at 8:00 AM or this is its first run at 8:30)
-        mock_now.return_value = datetime(2023, 10, 27, 8, 30, 0)
+        mock_now.return_value = datetime(2023, 10, 27, 8, 30, 0, tzinfo=timezone.utc)
         enqueued_jobs = scheduler.enqueue_jobs()
 
         # Only the 30-minute job should run (as it matches the current time)
         self.assertEqual(enqueued_jobs, [job_every_30_min])
 
         # Now advance to 9:00 AM
-        mock_now.return_value = datetime(2023, 10, 27, 9, 0, 0)
+        mock_now.return_value = datetime(2023, 10, 27, 9, 0, 0, tzinfo=timezone.utc)
         enqueued_jobs = scheduler.enqueue_jobs()
 
         # Now the 9 AM job should also run, but not the 10 AM job
@@ -458,12 +501,13 @@ class TestCronScheduler(RQTestCase):
         self.assertIn(job_9am, enqueued_jobs)
         self.assertNotIn(job_10am, enqueued_jobs)
 
+    @system_timezone('UTC')
     @patch('rq.cron.now')
     def test_calculate_sleep_interval_with_cron_jobs(self, mock_now):
         """Test calculate_sleep_interval with cron-scheduled jobs"""
         scheduler = CronScheduler(connection=self.connection)
         # Set current time to 8:58 AM
-        mock_now.return_value = datetime(2023, 10, 27, 8, 58, 0)
+        mock_now.return_value = datetime(2023, 10, 27, 8, 58, 0, tzinfo=timezone.utc)
 
         # Create jobs that will have next_enqueue_time set based on the mock time
         # Job 1: scheduled for every minute (next run at 8:59 AM, 1 minute away)
@@ -479,7 +523,7 @@ class TestCronScheduler(RQTestCase):
         self.assertEqual(actual_interval, 60.0)
 
         # Test with a closer time - 30 seconds before next job
-        mock_now.return_value = datetime(2023, 10, 27, 8, 58, 30)
+        mock_now.return_value = datetime(2023, 10, 27, 8, 58, 30, tzinfo=timezone.utc)
 
         actual_interval = scheduler.calculate_sleep_interval()
         # Should sleep for 30 seconds (not capped at 60)
@@ -588,8 +632,8 @@ class TestCronScheduler(RQTestCase):
         with self.assertRaises(ValueError):
             job_1.enqueue(self.connection)
 
-    def test_save_jobs_data_updates_timing(self):
-        """Test that save_jobs_data() updates job timing information in Redis"""
+    def test_save_persists_job_timing(self):
+        """Test that save() persists updated job timing information in Redis"""
         scheduler = CronScheduler(connection=self.connection, name='test-scheduler')
 
         # Register a job with interval
@@ -613,8 +657,8 @@ class TestCronScheduler(RQTestCase):
         job.latest_enqueue_time = last_enqueue_time
         job.next_enqueue_time = next_time
 
-        # Save only jobs data (not full scheduler state)
-        scheduler.save_jobs_data()
+        # save() persists the full scheduler state, including job timing
+        scheduler.save()
 
         # Fetch again and verify timing was updated
         fetched_scheduler = CronScheduler.fetch('test-scheduler', self.connection)
@@ -630,7 +674,15 @@ class TestCronScheduler(RQTestCase):
         self.assertEqual(updated_jobs[0].next_enqueue_time.replace(microsecond=0), next_time.replace(microsecond=0))
 
     def test_cron_scheduler_restore_edge_cases(self):
-        """Test that restore() handles missing and malformed cron_jobs data gracefully"""
+        """Test that restore() handles missing fields and malformed cron_jobs data gracefully"""
+        # Test a partial hash missing scheduler metadata fields
+        scheduler = CronScheduler(connection=self.connection, name='partial-scheduler')
+        scheduler.restore({b'cron_jobs': b'[]'})
+        self.assertEqual(scheduler.name, 'partial-scheduler')
+        self.assertEqual(scheduler.hostname, '')
+        self.assertEqual(scheduler.pid, 0)
+        self.assertEqual(len(scheduler.get_jobs()), 0)
+
         # Test missing cron_jobs field (backwards compatibility)
         data = {
             b'hostname': b'test-host',
@@ -697,10 +749,10 @@ class TestCronScheduler(RQTestCase):
         # Verify Redis hash data was saved
         self.assertTrue(self.connection.exists(scheduler.key))
 
-        # Verify TTL is set (should be 60 seconds)
+        # Verify TTL is set
         ttl = self.connection.ttl(scheduler.key)
         self.assertGreater(ttl, 0)
-        self.assertLessEqual(ttl, 60)
+        self.assertLessEqual(ttl, DEFAULT_CRON_SCHEDULER_TTL)
 
         # Register death
         scheduler.register_death()
@@ -722,9 +774,9 @@ class TestCronScheduler(RQTestCase):
         initial_score = self.connection.zscore(registry_key, scheduler.name)
         self.assertIsNotNone(initial_score)
 
-        # Verify initial TTL (should be 60 seconds from register_birth)
+        # Verify initial TTL from register_birth
         initial_ttl = self.connection.ttl(scheduler.key)
-        self.assertTrue(0 < initial_ttl <= 60)
+        self.assertTrue(0 < initial_ttl <= DEFAULT_CRON_SCHEDULER_TTL)
 
         # Wait a brief moment to ensure timestamp difference
         time.sleep(0.01)
@@ -734,21 +786,50 @@ class TestCronScheduler(RQTestCase):
         self.assertIsNotNone(new_score)
         self.assertGreater(cast(float, new_score), cast(float, initial_score))
 
-        # Verify TTL was extended to 120 seconds
+        # Verify TTL was refreshed
         new_ttl = self.connection.ttl(scheduler.key)
-        self.assertTrue(60 < new_ttl <= 120)
+        self.assertTrue(0 < new_ttl <= DEFAULT_CRON_SCHEDULER_TTL)
 
         scheduler.register_death()
 
-        # Test heartbeat on unregistered scheduler
+        # Heartbeat on an unregistered scheduler registers it and saves its hash
         unregistered_scheduler = CronScheduler(connection=self.connection, name='unregistered-scheduler')
-
-        # This should not raise an exception, but should log a warning
         unregistered_scheduler.heartbeat()
 
-        # Verify unregistered scheduler is still not in registry
         score = self.connection.zscore(registry_key, 'unregistered-scheduler')
-        self.assertIsNone(score)
+        self.assertIsNotNone(score)
+        self.assertTrue(self.connection.exists(unregistered_scheduler.key))
+
+        unregistered_scheduler.register_death()
+        self.connection.delete(unregistered_scheduler.key)
+
+    def test_heartbeat_resurrects_scheduler_after_expiry(self):
+        """Test that heartbeat() re-creates the scheduler hash and registry entry after expiry"""
+        scheduler = CronScheduler(connection=self.connection, name='resurrected-scheduler')
+        scheduler.register(say_hello, 'default', interval=60)
+        scheduler.register_birth()
+
+        # Simulate the hash expiring and the registry entry being pruned,
+        # e.g. after the host slept longer than the heartbeat TTL
+        self.connection.delete(scheduler.key)
+        self.connection.zrem(get_registry_key(), scheduler.name)
+
+        scheduler.heartbeat()
+
+        # Scheduler is visible to monitoring again, with its full state restored
+        schedulers = CronScheduler.all(self.connection)
+        scheduler_names = [found_scheduler.name for found_scheduler in schedulers]
+        self.assertIn('resurrected-scheduler', scheduler_names)
+
+        fetched_scheduler = CronScheduler.fetch('resurrected-scheduler', self.connection)
+        self.assertEqual(fetched_scheduler.hostname, scheduler.hostname)
+        self.assertEqual(fetched_scheduler.pid, scheduler.pid)
+        restored_jobs = fetched_scheduler.get_jobs()
+        self.assertEqual(len(restored_jobs), 1)
+        self.assertEqual(restored_jobs[0].interval, 60)
+
+        scheduler.register_death()
+        self.connection.delete(scheduler.key)
 
     @patch('rq.cron.CronScheduler.register_death')
     @patch('rq.cron.CronScheduler._install_signal_handlers')
@@ -782,31 +863,44 @@ class TestCronScheduler(RQTestCase):
 
     def test_sigint_handling(self):
         """Test that sending SIGINT to the process stops the scheduler"""
-        conn_kwargs = self.connection.connection_pool.connection_kwargs
+        conn_kwargs = get_connection_kwargs(self.connection)
         scheduler_process = Process(target=run_scheduler, args=(conn_kwargs,))
         scheduler_process.start()
         assert scheduler_process.pid
-        time.sleep(0.2)
+
         # Ensure scheduler is registered (name will have random suffix)
         scheduler_prefix = f'{socket.gethostname()}:{scheduler_process.pid}:'
 
-        # Find scheduler with matching prefix
-        matching_scheduler = None
-        for key in get_keys(self.connection):
-            if key.startswith(scheduler_prefix):
-                matching_scheduler = key
-                break
+        try:
+            # Find scheduler with matching prefix
+            deadline = time.time() + 5
+            matching_scheduler = None
+            keys = []
+            while time.time() < deadline and scheduler_process.is_alive():
+                keys = get_keys(self.connection)
+                matching_scheduler = next((key for key in keys if key.startswith(scheduler_prefix)), None)
+                if matching_scheduler:
+                    break
+                time.sleep(0.05)
 
-        self.assertTrue(matching_scheduler)
+            self.assertTrue(
+                matching_scheduler,
+                f'Cron scheduler {scheduler_prefix} was not registered. '
+                f'Process exitcode: {scheduler_process.exitcode}. Registered schedulers: {keys}',
+            )
 
-        os.kill(scheduler_process.pid, signal.SIGINT)
+            os.kill(scheduler_process.pid, signal.SIGINT)
 
-        scheduler_process.join(timeout=2)
-        self.assertFalse(scheduler_process.is_alive())
+            scheduler_process.join(timeout=2)
+            self.assertFalse(scheduler_process.is_alive())
 
-        # Verify scheduler is no longer registered
-        keys = get_keys(self.connection)
-        self.assertEqual([key for key in keys if key.startswith(scheduler_prefix)], [])
+            # Verify scheduler is no longer registered
+            keys = get_keys(self.connection)
+            self.assertEqual([key for key in keys if key.startswith(scheduler_prefix)], [])
+        finally:
+            if scheduler_process.is_alive():
+                scheduler_process.terminate()
+                scheduler_process.join(timeout=2)
 
     def test_last_heartbeat_property(self):
         """Test that last_heartbeat property works correctly in all scenarios"""

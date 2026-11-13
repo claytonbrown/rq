@@ -182,11 +182,12 @@ print('Total working time: '+ worker.total_working_time)  # In seconds
 * `pid` - worker's process ID
 * `queues` - queues on which this worker is listening for jobs
 * `state` - possible states are `suspended`, `started`, `busy` and `idle`
-* `current_job` - the job it's currently executing (if any)
+* `get_current_executions()` - the executions the worker is currently running, cached after the first call; pass `refresh=True` to refetch from Redis
 * `last_heartbeat` - the last time this worker was seen
 * `birth_date` - time of worker's instantiation
 * `successful_job_count` - number of jobs finished successfully
 * `failed_job_count` - number of failed jobs processed
+* `current_execution_count` - number of executions the worker currently handling
 * `total_working_time` - amount of time spent executing jobs, in seconds
 
 If you only want to know the number of workers for monitoring purposes,
@@ -320,6 +321,10 @@ $ rq worker -c settings
 
 Alternatively, you can also pass in these options via environment variables.
 
+## Logging
+
+RQ logs to the `rq.worker`, `rq.job`, `rq.queue`, `rq.scheduler`, `rq.cron` and `rq.worker_pool` loggers. RQ only sets up its own log handlers when no handler is configured anywhere in the logger hierarchy, so if your application configures logging first, RQ leaves it untouched.
+
 ## Custom Worker Classes
 
 There are times when you want to customize the worker's behavior. Some of the
@@ -347,6 +352,11 @@ A worker implementation that executes jobs in the same process, without using `f
 
 `SimpleWorker` does not provide periodic heartbeats during job execution.
 This means long-running jobs may appear to be "stuck" from monitoring tools' perspective.
+
+Because jobs run in the worker process, imported Python modules stay loaded between jobs. Source code
+changes made while a `SimpleWorker` is running are therefore not reloaded automatically; restart the
+worker to make subsequent jobs use the updated code.
+
 `SimpleWorker` is not recommended for production use unless you fully understand these limitations.
 
 Usage:
@@ -411,8 +421,8 @@ rq worker -w rq.worker.RandomWorker q1 q2 q3
 ### SpawnWorker
 _New in version 2.2.0._
 
-The `SpawnWorker` uses `os.spawn()` instead of `os.fork()` to run jobs. This is useful in environments
-where `fork()` is not available, like Windows or newer versions of MacOS.
+`SpawnWorker` uses `os.posix_spawn()` to avoid unsafe forking on platforms such as macOS.
+It requires POSIX; use `SimpleWorker` on Windows.
 
 Usage:
 ```python
@@ -433,7 +443,7 @@ The main differences between these workers are:
 - SimpleWorker: No process forking, simpler but less isolated execution. Also no periodic heartbeats during job executions.
 - RoundRobinWorker: Fair scheduling across queues
 - RandomWorker: Random queue selection for load balancing
-- SpawnWorker: Windows compatibility using spawn() instead of fork()
+- SpawnWorker: Spawns instead of forking, for platforms where `fork()` is unsafe
 
 Choose the appropriate worker type based on your needs for job isolation, queue scheduling, and platform compatibility.
 
@@ -572,3 +582,6 @@ Options:
 * `-S` or `--serializer <serializer>`: accepts the shorthand `json` or `pickle`, or a dotted import path. Defaults to `rq.serializers.PickleSerializer`.
 * `-P` or `--path <path>`: multiple import paths are supported (e.g `rq worker --path foo --path bar`).
 * `-j` or `--job-class <path.to.Job>`: defaults to `rq.job.Job`.
+* `--queue-class <path.to.Queue>`: defaults to `rq.Queue`.
+* `--exception-handler`: path to exception handler class. Multiple exception handlers are supported (e.g `rq worker-pool --exception-handler 'path.to.my.ErrorHandler' --exception-handler 'another.ErrorHandler'`).
+* `-c` or `--config <module>`: module containing RQ settings, in the same format as [`rq worker`](#using-a-config-file). `rq worker-pool` honors the connection settings (`REDIS_URL`, `REDIS_HOST`, `SENTINEL`, etc.), `QUEUES` and `DICT_CONFIG`. Command line arguments take precedence over settings read from the config file.

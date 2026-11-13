@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from time import sleep
@@ -19,7 +20,7 @@ from rq.serializers import JSONSerializer
 from rq.timeouts import UnixSignalDeathPenalty
 from rq.worker import Worker, WorkerStatus
 from tests import RQTestCase
-from tests.fixtures import div_by_zero, say_hello
+from tests.fixtures import CustomJob, CustomQueue, div_by_zero, say_hello
 
 
 class CLITestCase(RQTestCase):
@@ -30,6 +31,7 @@ class CLITestCase(RQTestCase):
         self.connection: Redis = Redis.from_url(self.redis_url)
 
     def tearDown(self):
+        super().tearDown()
         self.connection.close()
 
     def assert_normal_execution(self, result):
@@ -500,6 +502,21 @@ class TestRQCli(CLITestCase):
             Job(job_id, serializer=JSONSerializer, connection=self.connection).result, 'Hi there, Stranger!'
         )
 
+    def test_cli_enqueue_with_job_class(self):
+        """rq enqueue -u <url> --job-class tests.fixtures.CustomJob tests.fixtures.say_hello"""
+        runner = CliRunner()
+        args = ['enqueue', '-u', self.redis_url, '--job-class', 'tests.fixtures.CustomJob', '--job-id', 'custom']
+        with patch.object(CustomJob, 'redis_job_namespace_prefix', 'custom:job:'):
+            result = runner.invoke(main, [*args, 'tests.fixtures.say_hello'])
+            self.assert_normal_execution(result)
+            self.assertTrue(self.connection.exists('custom:job:custom'))
+            self.assertFalse(self.connection.exists('rq:job:custom'))
+
+            queue = Queue(connection=self.connection, job_class=CustomJob)
+            worker = Worker(queue, connection=self.connection, job_class=CustomJob)
+            worker.work(burst=True)
+            self.assertEqual(CustomJob.fetch('custom', connection=self.connection).result, 'Hi there, Stranger!')
+
     def test_cli_enqueue_args(self):
         """rq enqueue -u <url> tests.fixtures.echo hello ':[1, {"key": "value"}]' json:=["abc"] nojson=def"""
         queue = Queue(connection=self.connection)
@@ -616,6 +633,22 @@ class TestRQCli(CLITestCase):
         self.assertEqual(len(registry), 1)
 
         self.assertFalse(worker.work(True))
+
+    def test_cli_enqueue_schedule_at_front(self):
+        """rq enqueue --at-front --schedule-at puts the job at the front of the queue when it is due"""
+        queue = Queue(connection=self.connection)
+        queued_job = queue.enqueue(say_hello)
+
+        runner = CliRunner()
+        for job_id, options in (('at-front', ['--at-front']), ('at-back', [])):
+            args = ['enqueue', '-u', self.redis_url, '--job-id', job_id, '--schedule-at', '2021-01-01T00:00:00']
+            result = runner.invoke(main, [*args, *options, 'tests.fixtures.say_hello'])
+            self.assert_normal_execution(result)
+
+        scheduler = RQScheduler(queue, self.connection)
+        scheduler.acquire_locks()
+        scheduler.enqueue_scheduled_jobs()
+        self.assertEqual(queue.get_job_ids(), ['at-front', queued_job.id, 'at-back'])
 
     def test_cli_enqueue_retry(self):
         """rq enqueue -u <url> tests.fixtures.say_hello --retry-max 3 --retry-interval 10 --retry-interval 20
@@ -822,6 +855,17 @@ class TestRQCli(CLITestCase):
 
 
 class WorkerPoolCLITestCase(CLITestCase):
+    def test_config_file_logging(self):
+        """rq worker-pool -u <url> -b -c tests.config_files.dummy_logging"""
+        runner = CliRunner()
+        result = runner.invoke(
+            main, ['worker-pool', '-u', self.redis_url, '-b', '-c', 'tests.config_files.dummy_logging']
+        )
+        self.assert_normal_execution(result)
+        # DICT_CONFIG from the config file should have been applied
+        formats = [handler.formatter._fmt for handler in logging.getLogger().handlers if handler.formatter]
+        self.assertTrue(any('MY_LOG_FMT' in fmt for fmt in formats))
+
     def test_worker_pool_burst_and_num_workers(self):
         """rq worker-pool -u <url> -b -n 3"""
         runner = CliRunner()
@@ -870,6 +914,17 @@ class WorkerPoolCLITestCase(CLITestCase):
         )
         self.assertNotEqual(result.exit_code, 0)
 
+    def test_queue_class_argument(self):
+        """rq worker-pool -u <url> -b --queue-class tests.fixtures.CustomQueue"""
+        queue = CustomQueue('default', connection=self.connection)
+        job = queue.enqueue(say_hello)
+        runner = CliRunner()
+        result = runner.invoke(
+            main, ['worker-pool', '-u', self.redis_url, '-b', '--queue-class', 'tests.fixtures.CustomQueue']
+        )
+        self.assert_normal_execution(result)
+        self.assertEqual(job.get_status(refresh=True), JobStatus.FINISHED)
+
     def test_worker_pool_logging_options(self):
         """--quiet and --verbose logging options are supported"""
         runner = CliRunner()
@@ -881,6 +936,78 @@ class WorkerPoolCLITestCase(CLITestCase):
 
         # --quiet and --verbose are mutually exclusive
         result = runner.invoke(main, args + ['--quiet', '--verbose'])
+        self.assertNotEqual(result.exit_code, 0)
+
+    def test_worker_pool_exception_handler(self):
+        """rq worker-pool -u <url> -b --exception-handler <handler>"""
+        connection = Redis.from_url(self.redis_url)
+        q = Queue('default', connection=connection)
+        registry = FailedJobRegistry(queue=q)
+
+        # Test with a job that raises an exception
+        job = q.enqueue(div_by_zero)
+
+        runner = CliRunner()
+        # With exception handler, job should be in failed registry with meta updated
+        result = runner.invoke(
+            main, ['worker-pool', '-u', self.redis_url, '-b', '--exception-handler', 'tests.fixtures.add_meta']
+        )
+        self.assert_normal_execution(result)
+
+        # Job should be failed (exception handled by custom handler)
+        self.assertIn(job, registry)
+        job.refresh()
+        # Custom handler should have been called (add_meta sets foo=1)
+        self.assertEqual(job.meta, {'foo': 1})
+
+    def test_worker_pool_multiple_exception_handlers(self):
+        """rq worker-pool -u <url> -b --exception-handler <handler1> --exception-handler <handler2>"""
+        connection = Redis.from_url(self.redis_url)
+        q = Queue('default', connection=connection)
+        registry = FailedJobRegistry(queue=q)
+
+        # Test with a job that raises an exception and multiple handlers
+        job = q.enqueue(div_by_zero)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                'worker-pool',
+                '-u',
+                self.redis_url,
+                '-b',
+                '--exception-handler',
+                'tests.fixtures.add_meta',
+                '--exception-handler',
+                'tests.fixtures.black_hole',
+            ],
+        )
+        self.assert_normal_execution(result)
+
+        # Job should be failed (exception handled)
+        self.assertIn(job, registry)
+
+    def test_worker_pool_log_format(self):
+        """rq worker-pool -u <url> -b --log-format <format>"""
+        runner = CliRunner()
+        result = runner.invoke(main, ['worker-pool', '-u', self.redis_url, '-b', '--log-format', '%(message)s'])
+        self.assert_normal_execution(result)
+
+    def test_worker_pool_date_format(self):
+        """rq worker-pool -u <url> -b --date-format <format>"""
+        runner = CliRunner()
+        result = runner.invoke(main, ['worker-pool', '-u', self.redis_url, '-b', '--date-format', '%Y-%m-%d'])
+        self.assert_normal_execution(result)
+
+    def test_worker_pool_invalid_exception_handler(self):
+        """rq worker-pool -u <url> -b --exception-handler <invalid>"""
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ['worker-pool', '-u', self.redis_url, '-b', '--exception-handler', 'tests.fixtures.nonexistent_handler'],
+        )
+        # Should fail because handler doesn't exist
         self.assertNotEqual(result.exit_code, 0)
 
 

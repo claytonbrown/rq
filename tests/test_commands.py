@@ -6,7 +6,14 @@ from redis import Redis
 from redis.exceptions import ResponseError
 
 from rq import Queue, Worker
-from rq.command import send_command, send_kill_horse_command, send_shutdown_command, send_stop_job_command
+from rq.command import (
+    send_command,
+    send_kill_horse_command,
+    send_shutdown_command,
+    send_stop_execution_command,
+    send_stop_job_command,
+)
+from rq.connections import get_connection_kwargs
 from rq.exceptions import InvalidJobOperation, NoSuchJobError
 from rq.serializers import JSONSerializer
 from rq.worker import WorkerStatus
@@ -30,9 +37,7 @@ class TestCommands(RQTestCase):
         connection = self.connection
         worker = Worker('foo', connection=connection)
 
-        p = Process(
-            target=_send_shutdown_command, args=(worker.name, connection.connection_pool.connection_kwargs.copy())
-        )
+        p = Process(target=_send_shutdown_command, args=(worker.name, get_connection_kwargs(connection)))
         p.start()
         worker.work()
         p.join(1)
@@ -73,16 +78,14 @@ class TestCommands(RQTestCase):
         job = queue.enqueue(long_running_job, 4)
         worker = Worker('foo', connection=connection)
 
-        p = Process(
-            target=_send_kill_horse_command, args=(worker.name, connection.connection_pool.connection_kwargs.copy())
-        )
+        p = Process(target=_send_kill_horse_command, args=(worker.name, get_connection_kwargs(connection)))
         p.start()
         worker.work(burst=True)
         p.join(1)
         job.refresh()
         self.assertIn(job.id, queue.failed_job_registry)
 
-        p = Process(target=start_work, args=('foo', worker.name, connection.connection_pool.connection_kwargs.copy()))
+        p = Process(target=start_work, args=('foo', worker.name, get_connection_kwargs(connection)))
         p.start()
         p.join(2)
 
@@ -108,9 +111,7 @@ class TestCommands(RQTestCase):
         with self.assertRaises(NoSuchJobError):
             send_stop_job_command(connection, job_id='1', serializer=JSONSerializer)
 
-        p = Process(
-            target=start_work_burst, args=('foo', worker.name, connection.connection_pool.connection_kwargs.copy())
-        )
+        p = Process(target=start_work_burst, args=('foo', worker.name, get_connection_kwargs(connection)))
         p.start()
         p.join(1)
 
@@ -124,6 +125,41 @@ class TestCommands(RQTestCase):
 
         send_stop_job_command(connection, job_id=job.id, serializer=JSONSerializer)
         time.sleep(0.25)
+
+        # Job status is set appropriately
+        self.assertTrue(job.is_stopped)
+
+        # Worker has stopped working
+        worker.refresh()
+        self.assertEqual(worker.get_state(), WorkerStatus.IDLE)
+
+    def test_stop_execution_command(self):
+        """Ensure that stop-execution targets one specific execution."""
+        connection = self.connection
+        queue = Queue('foo', connection=connection, serializer=JSONSerializer)
+        job = queue.enqueue(long_running_job, 3)
+        worker = Worker('foo', connection=connection, serializer=JSONSerializer)
+
+        # An error is raised if the execution doesn't exist
+        with self.assertRaises(InvalidJobOperation):
+            send_stop_execution_command(connection, job_id=job.id, execution_id='nonexistent')
+
+        p = Process(target=start_work_burst, args=('foo', worker.name, get_connection_kwargs(connection)))
+        p.start()
+        p.join(1)
+
+        time.sleep(0.1)
+
+        execution = job.get_executions()[0]
+
+        # A non-matching execution id is ignored by the worker
+        send_command(connection, worker.name, 'stop-execution', job_id=job.id, execution_id='nonexistent')
+        time.sleep(0.1)
+        worker.refresh()
+        self.assertEqual(worker.get_state(), WorkerStatus.BUSY)
+
+        send_stop_execution_command(connection, job_id=job.id, execution_id=execution.id)
+        time.sleep(0.1)
 
         # Job status is set appropriately
         self.assertTrue(job.is_stopped)
